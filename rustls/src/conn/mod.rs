@@ -9,7 +9,7 @@ use pki_types::FipsStatus;
 use crate::common_state::{
     CommonState, ConnectionOutput, ConnectionOutputs, Event, Output, OutputEvent, UnborrowedPayload,
 };
-use crate::conn::receive::FinishOnAppData;
+use crate::conn::receive::{FinishHandshake, FinishOnAppData};
 use crate::error::{ApiMisuse, Error};
 use crate::kernel::KernelState;
 use crate::msgs::{Delocator, Message, Random, TlsInputBuffer, VecInput};
@@ -22,8 +22,7 @@ use crate::vecbuf::ChunkVecBuffer;
 pub mod kernel;
 
 mod receive;
-use receive::JoinOutput;
-pub(crate) use receive::{Input, ReceivePath, TrafficTemperCounters};
+pub(crate) use receive::{DropAppData, Input, JoinOutput, ReceivePath, TrafficTemperCounters};
 
 mod send;
 use send::DEFAULT_BUFFER_LIMIT;
@@ -785,6 +784,24 @@ impl<Side: SideData> ConnectionCore<Side> {
         self.common
             .recv
             .process_new_packets::<Side, FinishOnAppData>(buffer, &mut self.state, &mut output)
+    }
+
+    #[inline]
+    pub(crate) fn process_handshake<'a>(
+        &'a mut self,
+        buffer: &mut dyn TlsInputBuffer,
+        quic: Option<&'a mut dyn QuicOutput>,
+    ) -> Result<Option<UnborrowedPayload>, Error> {
+        let mut output = JoinOutput {
+            outputs: &mut self.common.outputs,
+            quic,
+            send: &mut self.common.send,
+            side: &mut self.side,
+        };
+
+        self.common
+            .recv
+            .process_new_packets::<Side, FinishHandshake>(buffer, &mut self.state, &mut output)
     }
 
     pub(crate) fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {

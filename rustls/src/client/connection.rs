@@ -340,7 +340,7 @@ impl EarlyData {
         )
     }
 
-    fn is_accepted(&self) -> bool {
+    pub(super) fn is_accepted(&self) -> bool {
         matches!(
             self.state,
             EarlyDataState::Accepted | EarlyDataState::AcceptedFinished
@@ -377,7 +377,7 @@ impl EarlyData {
         }
     }
 
-    fn check_write(&mut self, sz: usize) -> io::Result<usize> {
+    pub(super) fn check_write(&mut self, sz: usize) -> io::Result<usize> {
         self.check_write_opt(sz)
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))
     }
@@ -399,7 +399,7 @@ impl EarlyData {
         }
     }
 
-    fn bytes_left(&self) -> usize {
+    pub(super) fn bytes_left(&self) -> usize {
         self.left
     }
 }
@@ -415,7 +415,7 @@ enum EarlyDataState {
 }
 
 pub(crate) struct ClientConnectionData {
-    early_data: EarlyData,
+    pub(super) early_data: EarlyData,
     ech_status: EchStatus,
 }
 
@@ -425,6 +425,14 @@ impl ClientConnectionData {
             early_data: EarlyData::new(),
             ech_status: EchStatus::default(),
         }
+    }
+
+    pub(crate) fn early_data_is_enabled(&self) -> bool {
+        self.early_data.is_enabled()
+    }
+
+    pub(crate) fn ech_status(&self) -> EchStatus {
+        self.ech_status
     }
 }
 
