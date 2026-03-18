@@ -15,8 +15,8 @@ use crate::enums::{ContentType, HandshakeType, ProtocolVersion};
 use crate::error::{AlertDescription, Error, PeerMisbehaved};
 use crate::log::{trace, warn};
 use crate::msgs::{
-    AlertLevel, AlertLevelName, AlertMessagePayload, DeframerIter, Delocator,
-    HandshakeAlignedProof, HandshakeDeframer, Locator, Message, MessagePayload, TlsInputBuffer,
+    AlertLevel, AlertLevelName, AlertMessagePayload, Delocator, HandshakeAlignedProof,
+    HandshakeDeframer, Locator, Message, MessagePayload, TlsInputBuffer,
 };
 use crate::quic::QuicOutput;
 
@@ -173,13 +173,8 @@ impl ReceivePath {
                 }));
             }
 
-            let mut iter = DeframerIter::new(
-                &mut buffer[self.hs_deframer.processed()..],
-                self.hs_deframer.processed(),
-            );
-
             let (message, bounds, processed) = loop {
-                let (message, bounds) = match iter.next() {
+                let (message, bounds) = match self.hs_deframer.deframe(buffer) {
                     Some(Ok((message, bounds))) => (message, bounds),
                     Some(Err(err)) => return Err(err),
                     None => return Ok(None),
@@ -269,9 +264,6 @@ impl ReceivePath {
                     self.seen_consecutive_empty_fragments = 0;
                 }
             };
-
-            self.hs_deframer
-                .add_processed(processed);
 
             // do an end-run around the borrow checker, converting `message` (containing
             // a borrowed slice) to an unborrowed one (containing a `Range` into the

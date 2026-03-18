@@ -3,10 +3,11 @@ use core::ops::Range;
 use std::collections::VecDeque;
 
 use super::buffers::{Coalescer, Delocator};
-use crate::crypto::cipher::EncodedMessage;
+use crate::crypto::cipher::{EncodedMessage, InboundOpaque, MessageError};
 use crate::enums::{ContentType, ProtocolVersion};
-use crate::error::InvalidMessage;
-use crate::msgs::codec::{Codec, U24};
+use crate::error::{Error, InvalidMessage};
+use crate::msgs::codec::{Codec, Reader, U24};
+use crate::msgs::{HEADER_SIZE, read_opaque_message_header};
 
 #[derive(Debug)]
 pub(crate) struct HandshakeDeframer {
@@ -33,6 +34,45 @@ pub(crate) struct HandshakeDeframer {
 }
 
 impl HandshakeDeframer {
+    pub(crate) fn deframe<'a>(
+        &mut self,
+        buf: &'a mut [u8],
+    ) -> Option<Result<(EncodedMessage<InboundOpaque<'a>>, Range<usize>), Error>> {
+        let mut reader = Reader::new(buf.get(self.processed..)?);
+
+        let (typ, version, len) = match read_opaque_message_header(&mut reader) {
+            Ok(header) => header,
+            Err(err) => {
+                let err = match err {
+                    MessageError::TooShortForHeader | MessageError::TooShortForLength => {
+                        return None;
+                    }
+                    MessageError::InvalidEmptyPayload => InvalidMessage::InvalidEmptyPayload,
+                    MessageError::MessageTooLarge => InvalidMessage::MessageTooLarge,
+                    MessageError::InvalidContentType => InvalidMessage::InvalidContentType,
+                    MessageError::UnknownProtocolVersion => InvalidMessage::UnknownProtocolVersion,
+                };
+                return Some(Err(err.into()));
+            }
+        };
+
+        // we now have a TLS header and body on the front of `self.buf`.  remove
+        // it from the front.
+        let end = self.processed + HEADER_SIZE + len as usize;
+        let head = buf.get_mut(..end)?;
+        let bounds = self.processed..end;
+        self.processed = end;
+
+        Some(Ok((
+            EncodedMessage {
+                typ,
+                version,
+                payload: InboundOpaque(&mut head[bounds.start + HEADER_SIZE..]),
+            },
+            bounds,
+        )))
+    }
+
     /// Accepts a message into the deframer.
     ///
     /// `containing_buffer` allows mapping the message payload to its position
@@ -375,7 +415,7 @@ mod tests {
     use std::vec;
 
     use super::*;
-    use crate::msgs::{DeframerIter, HEADER_SIZE};
+    use crate::msgs::HEADER_SIZE;
 
     fn add_bytes(hs: &mut HandshakeDeframer, range: Range<usize>, within: &[u8]) {
         let msg = EncodedMessage {
@@ -478,15 +518,11 @@ mod tests {
         let mut input = include_bytes!("../../testdata/handshake-test.1.bin").to_vec();
 
         let mut hs = HandshakeDeframer::default();
-
-        let mut iter = DeframerIter::new(&mut input[..], 0);
-
-        while let Some(result) = iter.next() {
-            let (opaque, bounds) = result.unwrap();
-            let plain = opaque.into_plain_message();
+        while let Some(result) = hs.deframe(&mut input) {
+            let (message, bounds) = result.unwrap();
+            let plain = message.into_plain_message();
             std::println!("message {plain:?}");
 
-            hs.processed = bounds.end;
             hs.input_message(plain, bounds.start + HEADER_SIZE..bounds.end);
         }
 
