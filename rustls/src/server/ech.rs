@@ -705,18 +705,24 @@ pub(crate) enum EchOffer<'m> {
         inner_input: Option<crate::conn::Input<'m>>,
         state: EchServerState,
     },
+    /// Second ClientHello (HRR): use this inner input. The existing
+    /// `ech_state` was updated in place (inner_random set).
+    ResolvedHrr(crate::conn::Input<'m>),
     /// No ECH processing needed.
     None,
 }
 
-/// Resolve ECH on a ClientHello, handling the first ClientHello.
+/// Resolve ECH on a ClientHello, handling both first and second (HRR) attempts.
 ///
-/// Attempts ECH decryption using the server's configured keys.
+/// On the first ClientHello, attempts ECH decryption using the server's
+/// configured keys. On the second ClientHello after HRR, decrypts using the
+/// saved HPKE opener context (mutating `ech_state` in place).
 ///
 /// See <https://datatracker.ietf.org/doc/html/rfc9849#section-7.1>.
 pub(crate) fn resolve_ech<'m>(
     input: &crate::conn::Input<'m>,
     ech_keys: &[EchServerKey],
+    ech_state: Option<&mut EchServerState>,
     done_retry: bool,
 ) -> Result<EchOffer<'m>, Error> {
     use crate::enums::HandshakeType;
@@ -728,8 +734,11 @@ pub(crate) fn resolve_ech<'m>(
         HandshakePayload::ClientHello
     )?;
 
-    // Not handling HRR path yet; that will be added in a follow-up commit.
+    // Second ClientHello after HRR with accepted ECH: decrypt using saved opener.
     if done_retry {
+        if let Some(ech_state) = ech_state.filter(|s| s.status == EchStatus::Accepted) {
+            return resolve_ech_hrr(input, outer_hello, ech_state);
+        }
         return Ok(EchOffer::None);
     }
 
@@ -786,6 +795,93 @@ pub(crate) fn resolve_ech<'m>(
         }),
         EchDecryptResult::NotOffered | EchDecryptResult::InnerDirect => Ok(EchOffer::None),
     }
+}
+
+/// Decrypt the second ClientHello's ECH payload after a HelloRetryRequest.
+///
+/// The second ClientHello reuses the HPKE context from the first. A decryption
+/// failure here is fatal (unlike the first ClientHello, where it's non-fatal).
+///
+/// See <https://datatracker.ietf.org/doc/html/rfc9849#section-7.1>.
+pub(crate) fn decrypt_ech_hrr(
+    outer_hello: &ClientHelloPayload,
+    outer_encoded: &[u8],
+    outer_extensions_raw: &[u8],
+    opener: &mut Box<dyn HpkeOpener>,
+    expected_config_id: Option<u8>,
+    expected_cipher_suite: Option<HpkeSymmetricCipherSuite>,
+) -> Result<(ClientHelloPayload, Vec<u8>), Error> {
+    let ech_ext = match &outer_hello.encrypted_client_hello {
+        Some(EncryptedClientHello::Outer(outer)) => outer,
+        None => return Err(PeerMisbehaved::MissingEchExtension.into()),
+        _ => return Err(PeerMisbehaved::InvalidEchClientHelloInner.into()),
+    };
+
+    // The second ClientHello's ECH must have empty enc (RFC 9849 Section 7.1)
+    if !ech_ext.enc.bytes().is_empty() {
+        return Err(PeerMisbehaved::InvalidEchClientHelloInner.into());
+    }
+
+    // Verify config_id and cipher suite match the first ClientHello
+    if let Some(expected) = expected_config_id {
+        if ech_ext.config_id != expected {
+            return Err(PeerMisbehaved::EchHrrMismatch.into());
+        }
+    }
+    if let Some(expected) = expected_cipher_suite {
+        if ech_ext.cipher_suite != expected {
+            return Err(PeerMisbehaved::EchHrrMismatch.into());
+        }
+    }
+
+    let aad = compute_client_hello_outer_aad(outer_encoded, ech_ext);
+    let encoded_inner = opener
+        .open(&aad, ech_ext.payload.bytes())
+        .map_err(|_| Error::PeerMisbehaved(PeerMisbehaved::EchHrrDecryptionFailed))?;
+
+    decode_client_hello_inner(&encoded_inner, outer_hello, outer_extensions_raw)
+}
+
+/// Handle ECH on the second ClientHello after HRR.
+///
+/// Decrypts using the saved HPKE opener, updating `ech_state` in place.
+fn resolve_ech_hrr<'m>(
+    input: &crate::conn::Input<'m>,
+    outer_hello: &ClientHelloPayload,
+    ech_state: &mut EchServerState,
+) -> Result<EchOffer<'m>, Error> {
+    use crate::msgs::MessagePayload;
+
+    // Inner-direct on HRR: no decryption needed, just update inner_random.
+    if matches!(
+        outer_hello.encrypted_client_hello,
+        Some(EncryptedClientHello::Inner)
+    ) {
+        ech_state.inner_random = outer_hello.random;
+        return Ok(EchOffer::None);
+    }
+
+    let outer_encoded = match &input.message.payload {
+        MessagePayload::Handshake { encoded, .. } => encoded.bytes(),
+        _ => unreachable!(),
+    };
+    let outer_extensions_raw = extract_extensions_from_client_hello(outer_encoded)?;
+
+    let (inner_hello, inner_hello_raw) = decrypt_ech_hrr(
+        outer_hello,
+        outer_encoded,
+        outer_extensions_raw,
+        &mut ech_state.opener,
+        ech_state.config_id,
+        ech_state.cipher_suite,
+    )?;
+    ech_state.inner_random = inner_hello.random;
+
+    Ok(EchOffer::ResolvedHrr(make_inner_input(
+        input,
+        inner_hello,
+        &inner_hello_raw,
+    )))
 }
 
 /// Collect retry_configs from all keys marked as retry configs.

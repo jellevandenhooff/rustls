@@ -992,6 +992,8 @@ pub enum PeerMisbehaved {
     EarlyDataAttemptedInSecondClientHello,
     EarlyDataExtensionWithoutResumption,
     EarlyDataOfferedWithVariedCipherSuite,
+    EchHrrDecryptionFailed,
+    EchHrrMismatch,
     HandshakeHashVariedAfterRetry,
     /// Received an alert with an undefined level and the given [`AlertDescription`]
     IllegalAlertLevel(u8, AlertDescription),
@@ -1019,6 +1021,7 @@ pub enum PeerMisbehaved {
     KeyUpdateReceivedInQuicConnection,
     MessageInterleavedWithHandshakeMessage,
     MissingBinderInPskExtension,
+    MissingEchExtension,
     MissingKeyShare,
     MissingPskModesExtension,
     MissingQuicTransportParameters,
@@ -1081,9 +1084,11 @@ impl From<PeerMisbehaved> for AlertDescription {
 
             PeerMisbehaved::IllegalWarningAlert(_) => Self::DecodeError,
 
-            PeerMisbehaved::IncorrectBinder | PeerMisbehaved::IncorrectFinished => {
-                Self::DecryptError
-            }
+            PeerMisbehaved::IncorrectBinder
+            | PeerMisbehaved::IncorrectFinished
+            | PeerMisbehaved::EchHrrDecryptionFailed => Self::DecryptError,
+
+            PeerMisbehaved::EchHrrMismatch => Self::IllegalParameter,
 
             PeerMisbehaved::InvalidEchClientHelloInner
             | PeerMisbehaved::InvalidEchOuterExtension
@@ -1092,7 +1097,8 @@ impl From<PeerMisbehaved> for AlertDescription {
             PeerMisbehaved::InvalidCertCompression
             | PeerMisbehaved::SelectedUnofferedCertCompression => Self::BadCertificate,
 
-            PeerMisbehaved::MissingKeyShare
+            PeerMisbehaved::MissingEchExtension
+            | PeerMisbehaved::MissingKeyShare
             | PeerMisbehaved::MissingPskModesExtension
             | PeerMisbehaved::MissingQuicTransportParameters => Self::MissingExtension,
 

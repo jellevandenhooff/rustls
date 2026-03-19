@@ -723,27 +723,32 @@ impl ExpectClientHello {
     ) -> Result<ServerState, Error> {
         // Resolve ECH: may replace input with the decrypted inner ClientHello.
         // See <https://datatracker.ietf.org/doc/html/rfc9849#section-7.1>.
-        let input =
-            match super::ech::resolve_ech(&outer_input, &self.config.ech_keys, self.done_retry)? {
-                super::ech::EchOffer::Resolved {
-                    inner_input: Some(inner_input),
-                    state,
-                } => {
-                    // ECH accepted.
-                    output.emit(Event::ServerEchStatus(EchStatus::Accepted));
-                    self.ech_state = Some(state);
-                    inner_input
-                }
-                super::ech::EchOffer::Resolved {
-                    inner_input: None,
-                    state,
-                } => {
-                    output.emit(Event::ServerEchStatus(state.status));
-                    self.ech_state = Some(state);
-                    outer_input
-                }
-                super::ech::EchOffer::None => outer_input,
-            };
+        let input = match super::ech::resolve_ech(
+            &outer_input,
+            &self.config.ech_keys,
+            self.ech_state.as_mut(),
+            self.done_retry,
+        )? {
+            super::ech::EchOffer::Resolved {
+                inner_input: Some(inner_input),
+                state,
+            } => {
+                // ECH accepted.
+                output.emit(Event::ServerEchStatus(EchStatus::Accepted));
+                self.ech_state = Some(state);
+                inner_input
+            }
+            super::ech::EchOffer::Resolved {
+                inner_input: None,
+                state,
+            } => {
+                output.emit(Event::ServerEchStatus(state.status));
+                self.ech_state = Some(state);
+                outer_input
+            }
+            super::ech::EchOffer::ResolvedHrr(inner_input) => inner_input,
+            super::ech::EchOffer::None => outer_input,
+        };
 
         let input = ClientHelloInput::from_input(&input)?;
         self.with_input(input, output)

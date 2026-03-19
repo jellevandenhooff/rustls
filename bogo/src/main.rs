@@ -2072,7 +2072,13 @@ fn handle_err(opts: &Options, err: Error) -> ! {
         Error::PeerMisbehaved(PeerMisbehaved::InvalidEchOuterExtension) => {
             quit(":INVALID_OUTER_EXTENSION:")
         }
-        Error::PeerMisbehaved(PeerMisbehaved::InvalidEchPadding) => quit(":DECODE_ERROR:"),
+        Error::PeerMisbehaved(
+            PeerMisbehaved::InvalidEchPadding | PeerMisbehaved::EchHrrMismatch,
+        ) => quit(":DECODE_ERROR:"),
+        Error::PeerMisbehaved(PeerMisbehaved::MissingEchExtension) => quit(":MISSING_EXTENSION:"),
+        Error::PeerMisbehaved(PeerMisbehaved::EchHrrDecryptionFailed) => {
+            quit(":DECRYPTION_FAILED:")
+        }
         Error::PeerMisbehaved(
             PeerMisbehaved::UnsolicitedEncryptedExtension
             | PeerMisbehaved::UnsolicitedServerHelloExtension
