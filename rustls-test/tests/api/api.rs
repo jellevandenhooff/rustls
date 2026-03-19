@@ -1367,6 +1367,100 @@ fn test_client_fips_service_indicator_includes_ech_hpke_suite() {
     }
 }
 
+#[cfg(feature = "aws-lc-rs")]
+#[test]
+fn test_ech_server_accepts_client_ech() {
+    use pki_types::DnsName;
+    use rustls::server::generate_ech_config;
+
+    let provider = provider::DEFAULT_TLS13_PROVIDER;
+
+    // Pick the first HPKE suite
+    let hpke_suite = ALL_SUPPORTED_SUITES[0];
+
+    // Generate an ECH config and server key
+    let (ech_server_key, config_list_bytes) = generate_ech_config(
+        hpke_suite,
+        0x42, // config_id
+        DnsName::try_from("public.example.com")
+            .unwrap()
+            .to_owned(),
+        128, // maximum_name_length
+    )
+    .unwrap();
+
+    // Set up server config with ECH key
+    let mut server_config = make_server_config(KeyType::EcdsaP256, &provider);
+    server_config.ech_keys = Arc::from(vec![ech_server_key]);
+
+    // Set up client config with ECH
+    let ech_config =
+        EchConfig::new(EchConfigListBytes::from(config_list_bytes), &[hpke_suite]).unwrap();
+
+    let client_config = ClientConfig::builder(provider.clone().into())
+        .with_ech(EchMode::Enable(ech_config))
+        .finish(KeyType::EcdsaP256);
+
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    do_handshake(&mut client, &mut server);
+    assert_eq!(client.ech_status(), rustls::client::EchStatus::Accepted);
+    assert_eq!(
+        server.ech_status(),
+        rustls::server::EchStatus::Accepted
+    );
+}
+
+
+#[cfg(feature = "aws-lc-rs")]
+#[test]
+fn test_ech_server_rejects_wrong_config_id() {
+    use pki_types::DnsName;
+    use rustls::server::generate_ech_config;
+
+    let provider = provider::DEFAULT_TLS13_PROVIDER;
+    let hpke_suite = ALL_SUPPORTED_SUITES[0];
+
+    // Generate ECH config for client with config_id=1
+    let (_ech_server_key_unused, config_list_bytes) = generate_ech_config(
+        hpke_suite,
+        1,
+        DnsName::try_from("public.example.com")
+            .unwrap()
+            .to_owned(),
+        128,
+    )
+    .unwrap();
+
+    // Generate DIFFERENT ECH config for server with config_id=2
+    let (ech_server_key, _) = generate_ech_config(
+        hpke_suite,
+        2,
+        DnsName::try_from("public.example.com")
+            .unwrap()
+            .to_owned(),
+        128,
+    )
+    .unwrap();
+
+    let mut server_config = make_server_config(KeyType::EcdsaP256, &provider);
+    server_config.ech_keys = Arc::from(vec![ech_server_key]);
+
+    let ech_config =
+        EchConfig::new(EchConfigListBytes::from(config_list_bytes), &[hpke_suite]).unwrap();
+
+    let client_config = ClientConfig::builder(provider.clone().into())
+        .with_ech(EchMode::Enable(ech_config))
+        .finish(KeyType::EcdsaP256);
+
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+
+    // The handshake should complete (server falls back to outer hello),
+    // but ECH should be rejected from the client's perspective.
+    let result = do_handshake_until_error(&mut client, &mut server);
+    // ECH rejection causes the client to abort with ech_required
+    assert!(result.is_err());
+}
+
 #[test]
 fn test_illegal_server_renegotiation_attempt_after_tls13_handshake() {
     let provider = provider::DEFAULT_TLS13_PROVIDER;
