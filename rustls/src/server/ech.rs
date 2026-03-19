@@ -946,6 +946,291 @@ pub(crate) fn server_ech_confirmation(
     )
 }
 
+// --- Split-mode frontend proxy ---
+
+/// TLS record header length: content_type(1) + version(2) + length(2).
+const TLS_RECORD_HEADER_LEN: usize = 5;
+
+/// ECH split-mode proxy for a client-facing frontend server.
+///
+/// In ECH split mode ([RFC 9849 Section 3.1]), a client-facing frontend holds
+/// the ECH private keys and decrypts the outer ClientHello. It forwards the
+/// reconstructed inner ClientHello (with the `ech_is_inner` type=1 marker)
+/// to the backend server, then acts as a TCP proxy. The backend completes
+/// the TLS handshake without needing the ECH keys.
+///
+/// This type handles the full proxy flow, including HelloRetryRequest. Feed
+/// it every client-to-server TLS record via [`process_client_record`]; it
+/// decrypts ECH from ClientHello records and returns everything else unchanged.
+/// Server-to-client records are always forwarded unchanged (the proxy does not
+/// need to inspect them).
+///
+/// # Example
+///
+/// ```text
+/// use rustls::server::EchProxy;
+///
+/// let mut proxy = EchProxy::new(&ech_keys);
+///
+/// // During the handshake, process each client-to-server TLS record:
+/// loop {
+///     let record = read_tls_record(&mut client)?;
+///     let forward = proxy.process_client_record(&record)?;
+///     backend.write_all(&forward)?;
+///
+///     if proxy.is_done() {
+///         break;
+///     }
+///
+///     // Forward server-to-client data unchanged.
+///     relay(&mut backend, &mut client)?;
+/// }
+///
+/// // Handshake complete, splice bidirectionally.
+/// splice(&mut client, &mut backend);
+/// ```
+///
+/// To read one TLS record from a socket:
+///
+/// ```text
+/// fn read_tls_record(rd: &mut impl Read) -> io::Result<Vec<u8>> {
+///     let mut header = [0u8; 5];
+///     rd.read_exact(&mut header)?;
+///     let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+///     let mut record = vec![0u8; 5 + len];
+///     record[..5].copy_from_slice(&header);
+///     rd.read_exact(&mut record[5..])?;
+///     Ok(record)
+/// }
+/// ```
+///
+/// [`process_client_record`]: EchProxy::process_client_record
+/// [RFC 9849 Section 3.1]: https://datatracker.ietf.org/doc/html/rfc9849#section-3.1
+pub struct EchProxy {
+    keys: alloc::sync::Arc<[EchServerKey]>,
+    frontend: Option<EchFrontend>,
+    done: bool,
+}
+
+impl EchProxy {
+    /// Create a new ECH proxy with the given server keys.
+    pub fn new(keys: alloc::sync::Arc<[EchServerKey]>) -> Self {
+        Self {
+            keys,
+            frontend: None,
+            done: false,
+        }
+    }
+
+    /// Process a client-to-server TLS record.
+    ///
+    /// If the record contains a ClientHello with ECH, decrypts it and returns
+    /// a TLS record containing the inner ClientHello. All other records are
+    /// returned unchanged.
+    ///
+    /// Call this for every client-to-server TLS record during the handshake.
+    /// After `is_done()` returns true, the proxy is no longer needed and the
+    /// caller should splice the streams bidirectionally.
+    pub fn process_client_record(&mut self, tls_record: &[u8]) -> Result<Vec<u8>, Error> {
+        // Only process Handshake records containing a ClientHello.
+        if !is_client_hello_record(tls_record) {
+            self.done = true;
+            return Ok(tls_record.to_vec());
+        }
+
+        if let Some(ref mut frontend) = self.frontend {
+            // Second ClientHello after HRR.
+            let inner = frontend.decrypt_client_hello_record_hrr(tls_record)?;
+            self.done = true;
+            Ok(inner)
+        } else {
+            // First ClientHello.
+            match EchFrontend::decrypt_client_hello_record(tls_record, &self.keys)? {
+                EchFrontendResult::Decrypted(inner, frontend) => {
+                    self.frontend = Some(frontend);
+                    Ok(inner)
+                }
+                EchFrontendResult::NotOffered => {
+                    self.done = true;
+                    Ok(tls_record.to_vec())
+                }
+                EchFrontendResult::Rejected(retry_configs) => {
+                    self.done = true;
+                    // Forward the original record; the caller can use retry_configs
+                    // if they need them (e.g. for logging).
+                    let _ = retry_configs;
+                    Ok(tls_record.to_vec())
+                }
+            }
+        }
+    }
+
+    /// Whether ECH processing is complete.
+    ///
+    /// After this returns true, all subsequent client-to-server and
+    /// server-to-client data should be forwarded unchanged (the proxy
+    /// becomes a TCP splice).
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+}
+
+/// Check if a TLS record is a Handshake record containing a ClientHello.
+fn is_client_hello_record(record: &[u8]) -> bool {
+    // ContentType::Handshake (0x16) and first payload byte is HandshakeType::ClientHello (0x01).
+    record.len() > TLS_RECORD_HEADER_LEN
+        && record[0] == 0x16
+        && record[TLS_RECORD_HEADER_LEN] == 0x01
+}
+
+/// Low-level HPKE state from decrypting a ClientHello, needed to handle
+/// a potential second ClientHello after HelloRetryRequest.
+///
+/// Most callers should use [`EchProxy`] instead.
+struct EchFrontend {
+    opener: Box<dyn HpkeOpener>,
+    config_id: u8,
+    cipher_suite: HpkeSymmetricCipherSuite,
+}
+
+/// Result of decrypting ECH from a ClientHello in the split-mode frontend.
+enum EchFrontendResult {
+    /// ECH was successfully decrypted. The `Vec<u8>` contains a complete TLS
+    /// record with the inner ClientHello, ready to forward to the backend.
+    Decrypted(Vec<u8>, EchFrontend),
+
+    /// ECH decryption failed (config mismatch, wrong key, etc).
+    /// The `Vec<u8>` contains the serialized retry_configs.
+    Rejected(Vec<u8>),
+
+    /// No ECH extension present.
+    NotOffered,
+}
+
+impl EchFrontend {
+    /// Decrypt ECH from a ClientHello TLS record.
+    fn decrypt_client_hello_record(
+        tls_record: &[u8],
+        ech_keys: &[EchServerKey],
+    ) -> Result<EchFrontendResult, Error> {
+        let (record_version, handshake_message) = parse_tls_record(tls_record)?;
+        let outer_hello = parse_client_hello(handshake_message)?;
+        let outer_extensions_raw = extract_extensions_from_client_hello(handshake_message)?;
+
+        let result = decrypt_ech(&outer_hello, handshake_message, outer_extensions_raw, ech_keys);
+        let retry_configs = collect_retry_configs(ech_keys);
+
+        match result {
+            EchDecryptResult::Accepted {
+                inner_hello_raw,
+                opener,
+                ..
+            } => {
+                let ech_ext = match &outer_hello.encrypted_client_hello {
+                    Some(EncryptedClientHello::Outer(o)) => o,
+                    _ => unreachable!(),
+                };
+
+                let inner_record =
+                    wrap_handshake_in_record(record_version, &encode_inner_hello(&inner_hello_raw));
+                let frontend = EchFrontend {
+                    opener,
+                    config_id: ech_ext.config_id,
+                    cipher_suite: ech_ext.cipher_suite,
+                };
+
+                Ok(EchFrontendResult::Decrypted(inner_record, frontend))
+            }
+            EchDecryptResult::Fatal(e) => Err(e),
+            EchDecryptResult::Rejected => {
+                let mut retry_bytes = Vec::new();
+                retry_configs.encode(&mut retry_bytes);
+                Ok(EchFrontendResult::Rejected(retry_bytes))
+            }
+            EchDecryptResult::NotOffered => Ok(EchFrontendResult::NotOffered),
+            EchDecryptResult::InnerDirect => {
+                // A client should never send the inner marker to the frontend.
+                Err(PeerMisbehaved::InvalidEchClientHelloInner.into())
+            }
+        }
+    }
+
+    /// Decrypt ECH from a second ClientHello TLS record after HelloRetryRequest.
+    fn decrypt_client_hello_record_hrr(
+        &mut self,
+        tls_record: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        let (record_version, handshake_message) = parse_tls_record(tls_record)?;
+        let outer_hello = parse_client_hello(handshake_message)?;
+        let outer_extensions_raw = extract_extensions_from_client_hello(handshake_message)?;
+
+        let (_inner_hello, inner_hello_raw) = decrypt_ech_hrr(
+            &outer_hello,
+            handshake_message,
+            outer_extensions_raw,
+            &mut self.opener,
+            Some(self.config_id),
+            Some(self.cipher_suite),
+        )?;
+
+        Ok(wrap_handshake_in_record(
+            record_version,
+            &encode_inner_hello(&inner_hello_raw),
+        ))
+    }
+}
+
+/// Parse a TLS record, returning (version, payload).
+fn parse_tls_record(record: &[u8]) -> Result<(u16, &[u8]), Error> {
+    if record.len() < TLS_RECORD_HEADER_LEN {
+        return Err(Error::General("TLS record too short".into()));
+    }
+
+    if record[0] != 0x16 {
+        return Err(Error::General(
+            "not a Handshake TLS record".into(),
+        ));
+    }
+
+    let version = u16::from_be_bytes([record[1], record[2]]);
+    let payload_len = u16::from_be_bytes([record[3], record[4]]) as usize;
+
+    if record.len() < TLS_RECORD_HEADER_LEN + payload_len {
+        return Err(Error::General("TLS record truncated".into()));
+    }
+
+    Ok((version, &record[TLS_RECORD_HEADER_LEN..TLS_RECORD_HEADER_LEN + payload_len]))
+}
+
+/// Wrap a handshake message in a TLS record.
+fn wrap_handshake_in_record(version: u16, handshake_message: &[u8]) -> Vec<u8> {
+    let len = handshake_message.len();
+    let mut record = Vec::with_capacity(TLS_RECORD_HEADER_LEN + len);
+    record.push(0x16); // ContentType::Handshake
+    record.extend_from_slice(&version.to_be_bytes());
+    record.extend_from_slice(&(len as u16).to_be_bytes());
+    record.extend_from_slice(handshake_message);
+    record
+}
+
+/// Parse a ClientHello from raw handshake message bytes.
+///
+/// `handshake_message` is `HandshakeType(1) || length(3) || ClientHello body`.
+fn parse_client_hello(handshake_message: &[u8]) -> Result<ClientHelloPayload, Error> {
+    let err = || -> Error { PeerMisbehaved::InvalidEchClientHelloInner.into() };
+
+    let mut r = Reader::new(handshake_message);
+
+    // Skip handshake header: type (1) + length (3)
+    let hs_type = u8::read(&mut r).map_err(|_| err())?;
+    if hs_type != 0x01 {
+        return Err(Error::General("not a ClientHello handshake message".into()));
+    }
+    let _len = u24_read(&mut r).ok_or_else(err)?;
+
+    ClientHelloPayload::read(&mut r).map_err(|_| err())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1284,5 +1569,69 @@ mod tests {
             decrypt_ech(&hello, &[], &[], &[key]),
             EchDecryptResult::Rejected
         ));
+    }
+
+    // --- Split-mode proxy helper tests ---
+
+    #[test]
+    fn is_client_hello_record_accepts_valid() {
+        // 0x16 = Handshake, version, length, then 0x01 = ClientHello
+        let record = [0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0x00, 0x00, 0x01, 0x00];
+        assert!(is_client_hello_record(&record));
+    }
+
+    #[test]
+    fn is_client_hello_record_rejects_non_handshake() {
+        // 0x17 = Application data
+        let record = [0x17, 0x03, 0x01, 0x00, 0x01, 0x01];
+        assert!(!is_client_hello_record(&record));
+    }
+
+    #[test]
+    fn is_client_hello_record_rejects_non_client_hello() {
+        // Handshake but type 0x02 = ServerHello
+        let record = [0x16, 0x03, 0x01, 0x00, 0x01, 0x02];
+        assert!(!is_client_hello_record(&record));
+    }
+
+    #[test]
+    fn is_client_hello_record_rejects_too_short() {
+        let record = [0x16, 0x03, 0x01, 0x00];
+        assert!(!is_client_hello_record(&record));
+    }
+
+    #[test]
+    fn parse_tls_record_valid() {
+        let record = [0x16, 0x03, 0x01, 0x00, 0x03, 0xAA, 0xBB, 0xCC];
+        let (version, payload) = parse_tls_record(&record).unwrap();
+        assert_eq!(version, 0x0301);
+        assert_eq!(payload, &[0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn parse_tls_record_rejects_too_short() {
+        assert!(parse_tls_record(&[0x16, 0x03]).is_err());
+    }
+
+    #[test]
+    fn parse_tls_record_rejects_non_handshake() {
+        let record = [0x17, 0x03, 0x01, 0x00, 0x01, 0x00];
+        assert!(parse_tls_record(&record).is_err());
+    }
+
+    #[test]
+    fn parse_tls_record_rejects_truncated_payload() {
+        // Claims 10 bytes of payload but only has 3
+        let record = [0x16, 0x03, 0x01, 0x00, 0x0A, 0x01, 0x02, 0x03];
+        assert!(parse_tls_record(&record).is_err());
+    }
+
+    #[test]
+    fn wrap_handshake_round_trips() {
+        let msg = &[0x01, 0x02, 0x03];
+        let record = wrap_handshake_in_record(0x0301, msg);
+        let (version, payload) = parse_tls_record(&record).unwrap();
+        assert_eq!(version, 0x0301);
+        assert_eq!(payload, msg);
     }
 }
