@@ -1,11 +1,16 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::crypto::hpke::{Hpke, HpkePrivateKey};
+use alloc::boxed::Box;
+
+use crate::crypto::hpke::{
+    EncapsulatedSecret, Hpke, HpkeOpener, HpkePrivateKey, HpkeSuite, HpkeSymmetricCipherSuite,
+};
 use crate::error::{Error, PeerMisbehaved};
+use crate::log::debug;
 use crate::msgs::{
-    ClientHelloPayload, Codec, EchConfigPayload, EncryptedClientHello, ExtensionType, Reader,
-    SizedPayload,
+    ClientHelloPayload, Codec, EchConfigPayload, EncryptedClientHello, EncryptedClientHelloOuter,
+    ExtensionType, Reader, SizedPayload,
 };
 
 /// A server-side ECH key, pairing a published ECH config with the corresponding
@@ -148,6 +153,220 @@ pub enum EchStatus {
     /// mismatch). The handshake proceeds on the outer ClientHello and
     /// retry_configs are sent in EncryptedExtensions.
     Rejected,
+}
+
+/// Result of attempting to decrypt an ECH offer.
+pub(crate) enum EchDecryptResult {
+    /// ECH was successfully decrypted.
+    Accepted {
+        inner_hello: ClientHelloPayload,
+        inner_hello_raw: Vec<u8>,
+        opener: Box<dyn HpkeOpener>,
+    },
+    /// HPKE decryption succeeded but the inner ClientHello is malformed.
+    /// This is fatal per RFC 9849 Section 7.1.
+    Fatal(Error),
+    /// The ClientHello contains an ECH inner marker (type=1), indicating the
+    /// hello IS the inner ClientHello (e.g. split-mode frontend forwarded it).
+    InnerDirect,
+    /// No ECH extension was present.
+    NotOffered,
+    /// ECH was offered but decryption failed.
+    Rejected,
+}
+
+/// Attempt to decrypt ECH from a ClientHello, trying all configured server keys.
+///
+/// See <https://datatracker.ietf.org/doc/html/rfc9849#section-7.1>.
+pub(crate) fn decrypt_ech(
+    outer_hello: &ClientHelloPayload,
+    outer_encoded: &[u8],
+    outer_extensions_raw: &[u8],
+    ech_keys: &[EchServerKey],
+) -> EchDecryptResult {
+    let ech_ext = match &outer_hello.encrypted_client_hello {
+        Some(EncryptedClientHello::Outer(outer)) => outer,
+        Some(EncryptedClientHello::Inner) => return EchDecryptResult::InnerDirect,
+        None => return EchDecryptResult::NotOffered,
+    };
+
+    if ech_keys.is_empty() {
+        return EchDecryptResult::Rejected;
+    }
+
+    debug!(
+        "ECH offer: config_id={}, cipher_suite={:?}",
+        ech_ext.config_id, ech_ext.cipher_suite
+    );
+
+    for key in ech_keys {
+        let Some(key_config_id) = key.config_id() else {
+            continue;
+        };
+
+        if key_config_id != ech_ext.config_id {
+            continue;
+        }
+
+        let EchConfigPayload::V18(contents) = &key.config else {
+            continue;
+        };
+
+        if !contents
+            .key_config
+            .symmetric_cipher_suites
+            .contains(&ech_ext.cipher_suite)
+        {
+            continue;
+        }
+
+        let expected_suite = HpkeSuite {
+            kem: contents.key_config.kem_id,
+            sym: ech_ext.cipher_suite,
+        };
+
+        let Some(hpke_suite) = key
+            .hpke_suites
+            .iter()
+            .find(|s| s.suite() == expected_suite)
+            .copied()
+        else {
+            continue;
+        };
+
+        match try_decrypt_ech(
+            outer_hello,
+            outer_encoded,
+            outer_extensions_raw,
+            ech_ext,
+            key,
+            hpke_suite,
+        ) {
+            TryDecryptResult::Ok(inner_hello, inner_hello_raw, opener) => {
+                return EchDecryptResult::Accepted {
+                    inner_hello,
+                    inner_hello_raw,
+                    opener,
+                };
+            }
+            TryDecryptResult::InnerInvalid(e) => {
+                return EchDecryptResult::Fatal(e);
+            }
+            TryDecryptResult::HpkeFailed => {
+                continue;
+            }
+        }
+    }
+
+    EchDecryptResult::Rejected
+}
+
+/// Outcome of a single decryption attempt against one key.
+enum TryDecryptResult {
+    HpkeFailed,
+    InnerInvalid(Error),
+    Ok(ClientHelloPayload, Vec<u8>, Box<dyn HpkeOpener>),
+}
+
+/// Try to decrypt an ECH offer using a specific server key and HPKE suite.
+fn try_decrypt_ech(
+    outer_hello: &ClientHelloPayload,
+    outer_encoded: &[u8],
+    outer_extensions_raw: &[u8],
+    ech_ext: &EncryptedClientHelloOuter,
+    key: &EchServerKey,
+    suite: &'static dyn Hpke,
+) -> TryDecryptResult {
+    let info = key.hpke_info();
+    let enc = EncapsulatedSecret(ech_ext.enc.bytes().to_vec());
+
+    let Ok(mut opener) = suite.setup_opener(&enc, &info, &key.private_key) else {
+        return TryDecryptResult::HpkeFailed;
+    };
+
+    let aad = compute_client_hello_outer_aad(outer_encoded, ech_ext);
+
+    let Ok(encoded_inner) = opener.open(&aad, ech_ext.payload.bytes()) else {
+        return TryDecryptResult::HpkeFailed;
+    };
+
+    match decode_client_hello_inner(&encoded_inner, outer_hello, outer_extensions_raw) {
+        Ok((inner_hello, inner_hello_raw)) => {
+            TryDecryptResult::Ok(inner_hello, inner_hello_raw, opener)
+        }
+        Err(e) => TryDecryptResult::InnerInvalid(e),
+    }
+}
+
+/// Construct the ClientHelloOuterAAD: the ClientHello body with the ECH payload
+/// replaced by zeros.
+///
+/// See <https://datatracker.ietf.org/doc/html/rfc9849#section-5.2>.
+fn compute_client_hello_outer_aad(
+    outer_encoded: &[u8],
+    ech_ext: &EncryptedClientHelloOuter,
+) -> Vec<u8> {
+    // Skip the 4-byte handshake header to get the ClientHello body.
+    let body = &outer_encoded[4..];
+    let mut aad = body.to_vec();
+
+    // Zero out the ECH ciphertext in the AAD by scanning for the
+    // encrypted_client_hello extension and zeroing its payload field.
+    // We walk extensions rather than using find_subsequence to avoid
+    // false matches against ciphertext that happens to appear elsewhere.
+    zero_ech_payload_in_extensions(&mut aad, ech_ext.payload.bytes().len());
+
+    aad
+}
+
+/// Walk the extensions in a ClientHello body and zero the ECH ciphertext payload.
+///
+/// `body` is the full ClientHello body (starting at version). We skip to the
+/// extensions, find the encrypted_client_hello extension, and zero its payload
+/// field (the last `payload_len` bytes of the extension data).
+fn zero_ech_payload_in_extensions(body: &mut [u8], payload_len: usize) {
+    // Skip to extensions: version(2) + random(32) + session_id(1+N) +
+    // cipher_suites(2+N) + compression(1+N) + extensions_length(2)
+    let mut pos = 2 + 32; // version + random
+    if pos >= body.len() {
+        return;
+    }
+    let sid_len = body[pos] as usize;
+    pos += 1 + sid_len;
+    if pos + 2 > body.len() {
+        return;
+    }
+    let cs_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+    pos += 2 + cs_len;
+    if pos >= body.len() {
+        return;
+    }
+    let comp_len = body[pos] as usize;
+    pos += 1 + comp_len;
+    if pos + 2 > body.len() {
+        return;
+    }
+    let _ext_total_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+    pos += 2;
+
+    // Walk extensions
+    while pos + 4 <= body.len() {
+        let ext_type = u16::from_be_bytes([body[pos], body[pos + 1]]);
+        let ext_len = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
+        let ext_data_start = pos + 4;
+        let ext_data_end = ext_data_start + ext_len;
+
+        if ext_type == u16::from(ExtensionType::EncryptedClientHello) {
+            // The payload is the last `payload_len` bytes of the extension data.
+            if ext_data_end <= body.len() && payload_len <= ext_len {
+                let payload_start = ext_data_end - payload_len;
+                body[payload_start..ext_data_end].fill(0);
+            }
+            return;
+        }
+
+        pos = ext_data_end;
+    }
 }
 
 // --- Wire-level ClientHello helpers ---
@@ -647,5 +866,101 @@ mod tests {
         let inner_exts = outer_ext_ref(&[0x0033]);
 
         assert!(expand_extensions_raw(&inner_exts, &[]).is_err());
+    }
+
+    #[test]
+    fn aad_zeros_ech_payload() {
+        use crate::msgs::HandshakeMessagePayload;
+        use crate::msgs::HandshakePayload;
+
+        let ech_outer = EncryptedClientHelloOuter {
+            cipher_suite: HpkeSymmetricCipherSuite::default(),
+            config_id: 42,
+            enc: SizedPayload::from(crate::crypto::cipher::Payload::new(vec![1, 2, 3])),
+            payload: SizedPayload::from(crate::crypto::cipher::Payload::new(vec![0xAA; 32])),
+        };
+
+        let mut outer_hello = make_hello([0u8; 32]);
+        outer_hello.encrypted_client_hello = Some(EncryptedClientHello::Outer(ech_outer.clone()));
+
+        let hmp = HandshakeMessagePayload(HandshakePayload::ClientHello(outer_hello));
+        let encoded = hmp.get_encoding();
+
+        let aad = compute_client_hello_outer_aad(&encoded, &ech_outer);
+
+        assert!(!aad.is_empty());
+        // The AAD should not contain the original 0xAA payload bytes
+        let has_aa_run = aad
+            .windows(32)
+            .any(|w| w.iter().all(|&b| b == 0xAA));
+        assert!(!has_aa_run, "AAD should have zeroed ECH payload");
+
+        // The AAD should contain zeroed bytes where the payload was
+        let has_zero_run = aad
+            .windows(32)
+            .any(|w| w.iter().all(|&b| b == 0x00));
+        assert!(has_zero_run, "AAD should contain zeroed payload");
+    }
+
+    #[test]
+    fn not_offered() {
+        let hello = make_hello([0u8; 32]);
+        assert!(matches!(
+            decrypt_ech(&hello, &[], &[], &[]),
+            EchDecryptResult::NotOffered
+        ));
+    }
+
+    #[test]
+    fn inner_direct() {
+        let mut hello = make_hello([0u8; 32]);
+        hello.encrypted_client_hello = Some(EncryptedClientHello::Inner);
+
+        assert!(matches!(
+            decrypt_ech(&hello, &[], &[], &[]),
+            EchDecryptResult::InnerDirect
+        ));
+    }
+
+    #[test]
+    fn rejected_no_keys() {
+        let mut hello = make_hello([0u8; 32]);
+        hello.encrypted_client_hello =
+            Some(EncryptedClientHello::Outer(EncryptedClientHelloOuter {
+                cipher_suite: HpkeSymmetricCipherSuite::default(),
+                config_id: 1,
+                enc: SizedPayload::from(crate::crypto::cipher::Payload::new(vec![0u8; 32])),
+                payload: SizedPayload::from(crate::crypto::cipher::Payload::new(vec![0u8; 64])),
+            }));
+
+        assert!(matches!(
+            decrypt_ech(&hello, &[], &[], &[]),
+            EchDecryptResult::Rejected
+        ));
+    }
+
+    #[test]
+    fn rejected_config_id_mismatch() {
+        let mut hello = make_hello([0u8; 32]);
+        hello.encrypted_client_hello =
+            Some(EncryptedClientHello::Outer(EncryptedClientHelloOuter {
+                cipher_suite: HpkeSymmetricCipherSuite::default(),
+                config_id: 99,
+                enc: SizedPayload::from(crate::crypto::cipher::Payload::new(vec![0u8; 32])),
+                payload: SizedPayload::from(crate::crypto::cipher::Payload::new(vec![0u8; 64])),
+            }));
+
+        // Key has config_id=1, hello has config_id=99, so should be rejected
+        let key = EchServerKey {
+            config: make_v18_config(1),
+            private_key: HpkePrivateKey::from(vec![0u8; 32]),
+            hpke_suites: vec![],
+            is_retry_config: true,
+        };
+
+        assert!(matches!(
+            decrypt_ech(&hello, &[], &[], &[key]),
+            EchDecryptResult::Rejected
+        ));
     }
 }
