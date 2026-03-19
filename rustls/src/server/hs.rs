@@ -733,10 +733,36 @@ impl ExpectClientHello {
                 inner_input: Some(inner_input),
                 state,
             } => {
-                // ECH accepted.
-                output.emit(Event::ServerEchStatus(EchStatus::Accepted));
+                // ECH accepted; defer the event until after the rewind check.
                 self.ech_state = Some(state);
-                inner_input
+
+                // ECH rewind: let the cert resolver decide whether to accept
+                // or reject the decrypted inner ClientHello. If rejected, fall
+                // back to the outer ClientHello without sending retry configs.
+                //
+                // This mirrors BoringSSL's ssl_select_cert_disable_ech.
+                let inner_hello = require_handshake_msg!(
+                    inner_input.message,
+                    HandshakeType::ClientHello,
+                    HandshakePayload::ClientHello
+                )?;
+                let inner_sni = inner_hello
+                    .server_name
+                    .as_ref()
+                    .and_then(ServerNamePayload::to_dns_name_normalized);
+
+                if self
+                    .config
+                    .cert_resolver
+                    .accept_ech(&ClientHello::for_ech_check(inner_sni.as_ref()))
+                {
+                    output.emit(Event::ServerEchStatus(EchStatus::Accepted));
+                    inner_input
+                } else {
+                    self.ech_state = Some(super::ech::EchServerState::rejected(Vec::new()));
+                    output.emit(Event::ServerEchStatus(EchStatus::Rejected));
+                    outer_input
+                }
             }
             super::ech::EchOffer::Resolved {
                 inner_input: None,

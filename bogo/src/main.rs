@@ -534,6 +534,7 @@ struct Options {
     on_resume_expect_ech_accept: bool,
     on_initial_expect_ech_accept: bool,
     enable_ech_grease: bool,
+    ech_rewind: bool,
     ech_server_configs: Vec<Vec<u8>>,
     ech_server_keys: Vec<Vec<u8>>,
     ech_is_retry_configs: Vec<bool>,
@@ -615,6 +616,7 @@ impl Options {
             on_resume_expect_ech_accept: false,
             on_initial_expect_ech_accept: false,
             enable_ech_grease: false,
+            ech_rewind: false,
             ech_server_configs: vec![],
             ech_server_keys: vec![],
             ech_is_retry_configs: vec![],
@@ -1029,7 +1031,9 @@ impl Options {
             "-expect-no-server-name" |
             "-expect-no-session" |
             "-expect-ticket-renewal" |
-            "-fail-early-callback-ech-rewind" |
+            "-fail-early-callback-ech-rewind" => {
+                self.ech_rewind = true;
+            }
             "-forbid-renegotiation-after-handshake" |
             "-handoff" |
             "-ipv6" |
@@ -1423,6 +1427,20 @@ impl SigningKey for FixedSignatureSchemeSigningKey {
     }
 }
 
+/// Wraps a cert resolver to reject ECH, triggering the rewind path.
+#[derive(Debug)]
+struct EchRewindResolver(Arc<dyn server::ServerCredentialResolver>);
+
+impl server::ServerCredentialResolver for EchRewindResolver {
+    fn resolve(&self, client_hello: &ClientHello<'_>) -> Result<SelectedCredential, Error> {
+        self.0.resolve(client_hello)
+    }
+
+    fn accept_ech(&self, _client_hello: &ClientHello<'_>) -> bool {
+        false
+    }
+}
+
 #[derive(Debug)]
 struct FixedSignatureSchemeServerCertResolver {
     credentials: Credentials,
@@ -1665,12 +1683,17 @@ fn make_server_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ServerConfi
     let mut credentials = cred.load_from_file(&provider);
     credentials.ocsp = Some(opts.server_ocsp_response.clone());
 
-    let cert_resolver = match cred.use_signing_scheme {
+    let cert_resolver: Arc<dyn server::ServerCredentialResolver> = match cred.use_signing_scheme {
         Some(scheme) => Arc::new(FixedSignatureSchemeServerCertResolver {
             credentials,
             scheme: lookup_scheme(scheme),
-        }) as Arc<dyn server::ServerCredentialResolver>,
+        }),
         None => Arc::new(SingleCredential::from(credentials)),
+    };
+    let cert_resolver: Arc<dyn server::ServerCredentialResolver> = if opts.ech_rewind {
+        Arc::new(EchRewindResolver(cert_resolver))
+    } else {
+        cert_resolver
     };
 
     let mut cfg = ServerConfig::builder(Arc::new(provider))

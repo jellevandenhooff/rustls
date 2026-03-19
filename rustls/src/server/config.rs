@@ -387,6 +387,23 @@ pub trait ServerCredentialResolver: Debug + Send + Sync {
     /// [`PeerIncompatible::NoServerNameProvided`]: crate::error::PeerIncompatible::NoServerNameProvided
     fn resolve(&self, client_hello: &ClientHello<'_>) -> Result<SelectedCredential, Error>;
 
+    /// Called after ECH decryption succeeds to check whether the server can
+    /// serve the decrypted inner ClientHello.
+    ///
+    /// Return `false` to reject ECH and fall back to processing the outer
+    /// ClientHello instead. No retry configs are sent in this case; the
+    /// server intentionally declines ECH for this SNI.
+    ///
+    /// This mirrors BoringSSL's `ssl_select_cert_disable_ech` early callback
+    /// return value. A typical use case is a server that receives an encrypted
+    /// SNI it cannot serve (e.g. because the inner SNI names a TLS 1.2-only
+    /// service).
+    ///
+    /// The default implementation always returns `true` (accept ECH).
+    fn accept_ech(&self, _client_hello: &ClientHello<'_>) -> bool {
+        true
+    }
+
     /// Returns which [`CertificateType`]s this resolver supports.
     ///
     /// Returning an empty slice will result in an error. The default implementation signals
@@ -415,6 +432,22 @@ pub struct ClientHello<'a> {
 }
 
 impl<'a> ClientHello<'a> {
+    /// Build a minimal `ClientHello` for an ECH acceptance check.
+    ///
+    /// Only the server name is populated; other fields use empty defaults.
+    pub(super) fn for_ech_check(sni: Option<&'a DnsName<'static>>) -> Self {
+        Self {
+            server_name: sni.map(Cow::Borrowed),
+            signature_schemes: &[],
+            alpn: None,
+            server_cert_types: None,
+            client_cert_types: None,
+            cipher_suites: &[],
+            certificate_authorities: None,
+            named_groups: None,
+        }
+    }
+
     pub(super) fn new(
         input: &'a ClientHelloInput<'a>,
         signature_schemes: &'a [SignatureScheme],
