@@ -229,6 +229,18 @@ pub struct ServerConfig {
 
     /// Policy for how an invalid Server Name Indication (SNI) value from a client is handled.
     pub invalid_sni_policy: InvalidSniPolicy,
+
+    /// ECH server keys for decrypting Encrypted Client Hello offers.
+    ///
+    /// Multiple keys can be configured to support key rotation: publish new configs
+    /// in DNS while still accepting connections encrypted to old configs during the
+    /// DNS TTL transition period.
+    ///
+    /// If empty, ECH is not supported and any ECH offers will be rejected (the server
+    /// will proceed with the outer ClientHello).
+    ///
+    /// Wrapped in `Arc` because `HpkePrivateKey` is not cloneable (it zeroizes on drop).
+    pub ech_keys: Arc<[super::EchServerKey]>,
 }
 
 impl ServerConfig {
@@ -692,6 +704,7 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
             cert_compression_cache: Arc::new(compress::CompressionCache::default()),
             cert_decompressors: compress::default_cert_decompressors().to_vec(),
             invalid_sni_policy: InvalidSniPolicy::default(),
+            ech_keys: Arc::from([]),
         })
     }
 }

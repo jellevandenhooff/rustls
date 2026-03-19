@@ -29,6 +29,9 @@ pub(crate) mod handy;
 pub use handy::ServerNameResolver;
 pub use handy::{NoServerSessionStorage, ServerSessionMemoryCache};
 
+pub(crate) mod ech;
+pub use ech::{EchServerKey, EchStatus, generate_ech_config};
+
 mod hs;
 pub(crate) use hs::ServerHandler;
 
