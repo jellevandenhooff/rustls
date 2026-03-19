@@ -126,7 +126,14 @@
     "TLS-ECH-Client-SkipInvalidPublicName*": "we allow underscore names, don't fallback on no ECH configs",
     "TLS-ECH-Client-TLS12-RejectRetryConfigs": "we disable TLS1.2 w/ ECH",
     "TLS-ECH-GREASE-Client-TLS12-RejectRetryConfigs": "we disable TLS1.2 w/ ECH",
-    "TLS-ECH-Server*": "ECH server support NYI",
+    "TLS-ECH-Server*HelloRetryRequest": "ECH HRR support NYI",
+    "TLS-ECH-Server-CorruptSecondEncryptedClientHello": "ECH HRR support NYI",
+    "TLS-ECH-Server-OmitSecondEncryptedClientHello": "ECH HRR support NYI",
+    "TLS-ECH-Server-DifferentConfigIDSecondClientHello": "ECH HRR support NYI",
+    "TLS-ECH-Server-ECHInner-HelloRetryRequest": "ECH HRR support NYI",
+    "TLS-ECH-Server-FailCallbackNeedRewind": "ECH rewind NYI",
+    "TLS-ECH-Server-RewindWithNoPublicName": "ECH rewind NYI",
+    "TLS-ECH-Server-AsyncEarlyCallback": "ECH rewind NYI",
 #endif
 #if defined(AWS_LC_RS)
     "MLKEMKeyShareIncludedSecond-MLKEM1024": "we only include a share for the first configured group",

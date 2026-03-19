@@ -347,11 +347,14 @@ fn exec(opts: &Options, mut sess: impl Connection + 'static, key_log: &KeyLogMem
         {
             let ech_accept_required =
                 (count == 0 && opts.on_initial_expect_ech_accept) || opts.expect_ech_accept;
-            if ech_accept_required
-                && !sess.is_handshaking()
-                && client(&mut sess).ech_status() != EchStatus::Accepted
-            {
-                quit_err("ECH was not accepted, but we expect the opposite");
+            if ech_accept_required && !sess.is_handshaking() {
+                let accepted = match opts.side {
+                    Side::Client => client(&mut sess).ech_status() == EchStatus::Accepted,
+                    Side::Server => server(&mut sess).ech_status() == ServerEchStatus::Accepted,
+                };
+                if !accepted {
+                    quit_err("ECH was not accepted, but we expect the opposite");
+                }
             }
         }
 

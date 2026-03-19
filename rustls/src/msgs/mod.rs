@@ -92,7 +92,8 @@ pub(crate) use handshake::{EcParameters, NewSessionTicketExtensions, ServerEcdhP
 
 mod server_hello;
 pub(crate) use server_hello::{
-    EchConfigContents, EchConfigPayload, HpkeKeyConfig, ServerExtensions, ServerHelloPayload,
+    EchConfigContents, EchConfigPayload, HpkeKeyConfig, ServerEncryptedClientHello,
+    ServerExtensions, ServerHelloPayload,
 };
 
 #[cfg(test)]

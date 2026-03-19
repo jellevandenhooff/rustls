@@ -70,6 +70,15 @@ impl ServerConnection {
         self.inner.core.side.server_name()
     }
 
+    /// Return the connection's Encrypted Client Hello (ECH) status.
+    ///
+    /// This indicates whether the client offered ECH, and if so, whether the
+    /// server successfully decrypted it. The value is available after the
+    /// ClientHello has been processed.
+    pub fn ech_status(&self) -> super::ech::EchStatus {
+        self.inner.core.side.ech_status
+    }
+
     /// Application-controlled portion of the resumption ticket supplied by the client, if any.
     ///
     /// Recovered from the prior session's `set_resumption_data`. Integrity is guaranteed by rustls.
@@ -609,6 +618,7 @@ pub(crate) struct ServerConnectionData {
     sni: Option<DnsName<'static>>,
     received_resumption_data: Option<Vec<u8>>,
     early_data: EarlyDataState,
+    ech_status: super::ech::EchStatus,
 }
 
 impl ServerConnectionData {
@@ -630,6 +640,7 @@ impl SideOutput for ServerConnectionData {
             Event::EarlyData(EarlyDataEvent::Accepted) => self.early_data.accept(),
             Event::ReceivedServerName(sni) => self.sni = sni,
             Event::ResumptionData(data) => self.received_resumption_data = Some(data),
+            Event::ServerEchStatus(status) => self.ech_status = status,
             _ => unreachable!(),
         }
     }

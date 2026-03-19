@@ -6,6 +6,7 @@ use core::fmt;
 
 use pki_types::DnsName;
 
+use super::ech::EchStatus;
 use super::{ClientHello, CommonServerSessionValue, ServerConfig, tls12, tls13};
 use crate::SupportedCipherSuite;
 use crate::common_state::{Event, Output, OutputEvent, Protocol};
@@ -402,7 +403,7 @@ impl ChooseConfig {
         output: &mut dyn Output<'_>,
     ) -> Result<ServerState, Error> {
         ExpectClientHello::new(config, extra_exts, self.resumption_data, self.protocol)
-            .with_input(ClientHelloInput::from_input(&self.client_hello)?, output)
+            .handle(self.client_hello, output)
     }
 
     pub(crate) fn client_hello(&self) -> &ClientHelloPayload {
@@ -438,6 +439,8 @@ pub(crate) struct ExpectClientHello {
     pub(super) using_ems: bool,
     pub(super) done_retry: bool,
     pub(super) send_tickets: usize,
+    /// ECH server state, set when ECH was accepted.
+    pub(super) ech_state: Option<super::ech::EchServerState>,
 }
 
 impl ExpectClientHello {
@@ -464,6 +467,7 @@ impl ExpectClientHello {
             using_ems: false,
             done_retry: false,
             send_tickets: 0,
+            ech_state: None,
         }
     }
 
@@ -713,14 +717,40 @@ impl ExpectClientHello {
 
 impl ExpectClientHello {
     pub(crate) fn handle<'m>(
-        self,
-        input: Input<'m>,
+        mut self,
+        outer_input: Input<'m>,
         output: &mut dyn Output<'_>,
     ) -> Result<ServerState, Error> {
+        // Resolve ECH: may replace input with the decrypted inner ClientHello.
+        // See <https://datatracker.ietf.org/doc/html/rfc9849#section-7.1>.
+        let input =
+            match super::ech::resolve_ech(&outer_input, &self.config.ech_keys, self.done_retry)? {
+                super::ech::EchOffer::Resolved {
+                    inner_input: Some(inner_input),
+                    state,
+                } => {
+                    // ECH accepted.
+                    output.emit(Event::ServerEchStatus(EchStatus::Accepted));
+                    self.ech_state = Some(state);
+                    inner_input
+                }
+                super::ech::EchOffer::Resolved {
+                    inner_input: None,
+                    state,
+                } => {
+                    output.emit(Event::ServerEchStatus(state.status));
+                    self.ech_state = Some(state);
+                    outer_input
+                }
+                super::ech::EchOffer::None => outer_input,
+            };
+
         let input = ClientHelloInput::from_input(&input)?;
         self.with_input(input, output)
     }
+}
 
+impl ExpectClientHello {
     fn set_resumption_data(&mut self, resumption_data: &[u8]) -> Result<(), Error> {
         self.resumption_data = resumption_data.to_vec();
         Ok(())

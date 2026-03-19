@@ -187,6 +187,7 @@ mod client_hello {
                     input.client_hello.session_id,
                     output,
                     kx_group.name(),
+                    st.ech_state.as_ref(),
                 );
                 if !st.protocol.is_quic() {
                     emit_fake_ccs(output);
@@ -258,6 +259,7 @@ mod client_hello {
                 resuming.as_ref(),
                 &input.proof,
                 &st.config,
+                st.ech_state.as_ref(),
             )?;
             if !st.done_retry && !st.protocol.is_quic() {
                 emit_fake_ccs(output);
@@ -291,6 +293,7 @@ mod client_hello {
                     .map(|(_, session)| session),
                 st.extra_exts,
                 &st.config,
+                st.ech_state.as_ref(),
             )?;
 
             let doing_client_auth = if full_handshake {
@@ -526,6 +529,7 @@ mod client_hello {
         resuming: Option<&(usize, Tls13ServerSessionValue<'_>)>,
         proof: &HandshakeAlignedProof,
         config: &ServerConfig,
+        ech_state: Option<&crate::server::ech::EchServerState>,
     ) -> Result<KeyScheduleHandshake, Error> {
         // Prepare key exchange; the caller already found the matching SupportedKxGroup
         let (share, kxgroup) = share_and_kxgroup;
@@ -540,12 +544,59 @@ mod client_hello {
             ..Default::default()
         });
 
+        let mut server_random = randoms.server;
+
+        // If ECH was accepted, compute the confirmation signal and embed it
+        // in the last 8 bytes of the server random.
+        //
+        // Per RFC 9849 Section 7.2:
+        // 1. Set the last 8 bytes of ServerHello.random to zero
+        // 2. Compute the transcript hash through this modified ServerHello
+        // 3. Derive accept_confirmation (independent of TLS key schedule)
+        // 4. Replace those 8 bytes with the confirmation value
+        if let Some(ech) = ech_state.filter(|e| e.status == crate::server::ech::EchStatus::Accepted)
+        {
+            // Create ServerHello with zeroed confirmation bytes for transcript
+            let mut conf_random = server_random;
+            conf_random[24..32].fill(0x00);
+
+            let conf_msg = Message {
+                version: ProtocolVersion::TLSv1_2,
+                payload: MessagePayload::handshake(HandshakeMessagePayload(
+                    HandshakePayload::ServerHello(ServerHelloPayload {
+                        legacy_version: ProtocolVersion::TLSv1_2,
+                        random: Random::from(conf_random),
+                        session_id: *session_id,
+                        cipher_suite: suite.common.suite,
+                        compression_method: Compression::Null,
+                        extensions: extensions.clone(),
+                    }),
+                )),
+            };
+
+            // Compute transcript hash through the modified ServerHello
+            let mut conf_transcript = transcript.clone();
+            conf_transcript.add_message(&conf_msg);
+            let transcript_hash = conf_transcript.current_hash();
+
+            // Derive the confirmation. This uses HKDF-Extract(0, inner_random),
+            // independent of the TLS key schedule.
+            let confirmation = crate::server::ech::server_ech_confirmation(
+                suite.hkdf_provider,
+                &ech.inner_random.0,
+                transcript_hash,
+            );
+
+            // Overwrite the last 8 bytes of the actual server random
+            server_random[24..32].copy_from_slice(&confirmation);
+        }
+
         let sh = Message {
             version: ProtocolVersion::TLSv1_2,
             payload: MessagePayload::handshake(HandshakeMessagePayload(
                 HandshakePayload::ServerHello(ServerHelloPayload {
                     legacy_version: ProtocolVersion::TLSv1_2,
-                    random: Random::from(randoms.server),
+                    random: Random::from(server_random),
                     session_id: *session_id,
                     cipher_suite: suite.common.suite,
                     compression_method: Compression::Null,
@@ -615,7 +666,54 @@ mod client_hello {
         session_id: SessionId,
         output: &mut dyn Output<'_>,
         group: NamedGroup,
+        ech_state: Option<&crate::server::ech::EchServerState>,
     ) {
+        // If ECH was accepted, compute the HRR confirmation signal.
+        // Per RFC 9849 Section 7.2.1, the HRR includes an encrypted_client_hello
+        // extension with 8 bytes of confirmation signal.
+        let ech_ext = if let Some(ech) =
+            ech_state.filter(|e| e.status == crate::server::ech::EchStatus::Accepted)
+        {
+            // Build the HRR with 8 zero bytes as placeholder, compute transcript,
+            // then derive the real confirmation.
+            let placeholder = [0u8; 8];
+            let placeholder_req = HelloRetryRequest {
+                legacy_version: ProtocolVersion::TLSv1_2,
+                session_id,
+                cipher_suite: suite.common.suite,
+                extensions: HelloRetryRequestExtensions {
+                    key_share: Some(group),
+                    supported_versions: Some(ProtocolVersion::TLSv1_3),
+                    encrypted_client_hello: Some(Payload::Owned(placeholder.to_vec())),
+                    ..Default::default()
+                },
+            };
+
+            // Compute transcript hash through the placeholder HRR
+            let placeholder_msg = Message {
+                version: ProtocolVersion::TLSv1_2,
+                payload: MessagePayload::handshake(HandshakeMessagePayload(
+                    HandshakePayload::HelloRetryRequest(placeholder_req),
+                )),
+            };
+
+            let mut conf_transcript = transcript.clone();
+            conf_transcript.rollup_for_hrr();
+            conf_transcript.add_message(&placeholder_msg);
+            let transcript_hash = conf_transcript.current_hash();
+
+            // Derive the HRR confirmation signal
+            let confirmation = crate::tls13::key_schedule::server_ech_hrr_confirmation_secret(
+                suite.hkdf_provider,
+                &ech.inner_random.0,
+                transcript_hash,
+            );
+
+            Some(Payload::Owned(confirmation.to_vec()))
+        } else {
+            None
+        };
+
         let req = HelloRetryRequest {
             legacy_version: ProtocolVersion::TLSv1_2,
             session_id,
@@ -623,6 +721,7 @@ mod client_hello {
             extensions: HelloRetryRequestExtensions {
                 key_share: Some(group),
                 supported_versions: Some(ProtocolVersion::TLSv1_3),
+                encrypted_client_hello: ech_ext,
                 ..Default::default()
             },
         };
@@ -708,6 +807,7 @@ mod client_hello {
         resumedata: Option<&Tls13ServerSessionValue<'_>>,
         extra_exts: ServerExtensionsInput,
         config: &ServerConfig,
+        ech_state: Option<&crate::server::ech::EchServerState>,
     ) -> Result<(Tls13Extensions, EarlyDataDecision), Error> {
         let (out, mut extensions) = Tls13Extensions::new(
             extra_exts,
@@ -717,6 +817,20 @@ mod client_hello {
             output,
             config,
         )?;
+
+        // If ECH was rejected, include retry_configs in EncryptedExtensions.
+        // Per RFC 9849 Section 7.1, the server MUST include retry_configs
+        // when rejecting ECH. When ECH is accepted, do NOT send this extension.
+        if let Some(ech) = ech_state {
+            if ech.status == crate::server::ech::EchStatus::Rejected
+                && !ech.retry_configs.is_empty()
+            {
+                extensions.encrypted_client_hello_ack =
+                    Some(crate::msgs::ServerEncryptedClientHello {
+                        retry_configs: ech.retry_configs.clone(),
+                    });
+            }
+        }
 
         let early_data = decide_if_early_data_allowed(
             output,

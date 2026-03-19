@@ -155,6 +155,77 @@ pub enum EchStatus {
     Rejected,
 }
 
+/// Server-side ECH state carried across the handshake.
+pub(crate) struct EchServerState {
+    /// The random from the inner ClientHello, needed for confirmation computation.
+    pub(crate) inner_random: crate::msgs::Random,
+    /// HPKE opener context, kept alive for decrypting a second ClientHello after HRR.
+    pub(crate) opener: Box<dyn HpkeOpener>,
+    /// Retry configs to send on rejection.
+    pub(crate) retry_configs: Vec<EchConfigPayload>,
+    /// Whether ECH was accepted or rejected.
+    pub(crate) status: EchStatus,
+    /// The config_id from the outer ClientHello (for validating the second after HRR).
+    pub(crate) config_id: Option<u8>,
+    /// The cipher suite from the outer ClientHello (for validating the second after HRR).
+    pub(crate) cipher_suite: Option<HpkeSymmetricCipherSuite>,
+}
+
+impl EchServerState {
+    /// Build state for an accepted ECH handshake.
+    pub(crate) fn accepted(
+        inner_random: crate::msgs::Random,
+        opener: Box<dyn HpkeOpener>,
+        retry_configs: Vec<EchConfigPayload>,
+        config_id: Option<u8>,
+        cipher_suite: Option<HpkeSymmetricCipherSuite>,
+    ) -> Self {
+        Self {
+            inner_random,
+            opener,
+            retry_configs,
+            status: EchStatus::Accepted,
+            config_id,
+            cipher_suite,
+        }
+    }
+
+    /// Build state for a rejected ECH handshake.
+    pub(crate) fn rejected(retry_configs: Vec<EchConfigPayload>) -> Self {
+        Self {
+            inner_random: crate::msgs::Random([0u8; 32]),
+            opener: Box::new(NoOpOpener),
+            retry_configs,
+            status: EchStatus::Rejected,
+            config_id: None,
+            cipher_suite: None,
+        }
+    }
+
+    /// Build state for an inner-direct handshake (split-mode or type=1 marker).
+    pub(crate) fn inner_direct(inner_random: crate::msgs::Random) -> Self {
+        Self {
+            inner_random,
+            opener: Box::new(NoOpOpener),
+            retry_configs: Vec::new(),
+            status: EchStatus::Accepted,
+            config_id: None,
+            cipher_suite: None,
+        }
+    }
+}
+
+/// A no-op HPKE opener used when no HPKE context is available (rejection path,
+/// inner-direct).
+#[derive(Debug)]
+pub(crate) struct NoOpOpener;
+
+impl HpkeOpener for NoOpOpener {
+    fn open(&mut self, _aad: &[u8], _ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
+        Err(Error::General("no HPKE context available".into()))
+    }
+}
+
 /// Result of attempting to decrypt an ECH offer.
 pub(crate) enum EchDecryptResult {
     /// ECH was successfully decrypted.
@@ -622,6 +693,161 @@ pub fn generate_ech_config(
         EchServerKey::new(config, private_key, suite),
         config_list_bytes,
     ))
+}
+
+/// Outcome of ECH resolution on a ClientHello.
+///
+/// See <https://datatracker.ietf.org/doc/html/rfc9849#section-7.1>.
+pub(crate) enum EchOffer<'m> {
+    /// First ClientHello: ECH was resolved. Use `inner_input` (if present)
+    /// instead of the outer, and install the given state.
+    Resolved {
+        inner_input: Option<crate::conn::Input<'m>>,
+        state: EchServerState,
+    },
+    /// No ECH processing needed.
+    None,
+}
+
+/// Resolve ECH on a ClientHello, handling the first ClientHello.
+///
+/// Attempts ECH decryption using the server's configured keys.
+///
+/// See <https://datatracker.ietf.org/doc/html/rfc9849#section-7.1>.
+pub(crate) fn resolve_ech<'m>(
+    input: &crate::conn::Input<'m>,
+    ech_keys: &[EchServerKey],
+    done_retry: bool,
+) -> Result<EchOffer<'m>, Error> {
+    use crate::enums::HandshakeType;
+    use crate::msgs::{HandshakePayload, MessagePayload};
+
+    let outer_hello = require_handshake_msg!(
+        input.message,
+        HandshakeType::ClientHello,
+        HandshakePayload::ClientHello
+    )?;
+
+    // Not handling HRR path yet; that will be added in a follow-up commit.
+    if done_retry {
+        return Ok(EchOffer::None);
+    }
+
+    // Check for inner marker (split-mode support).
+    if matches!(
+        outer_hello.encrypted_client_hello,
+        Some(EncryptedClientHello::Inner)
+    ) {
+        return Ok(EchOffer::Resolved {
+            inner_input: None,
+            state: EchServerState::inner_direct(outer_hello.random),
+        });
+    }
+
+    if ech_keys.is_empty() {
+        return Ok(EchOffer::None);
+    }
+
+    let outer_encoded = match &input.message.payload {
+        MessagePayload::Handshake { encoded, .. } => encoded.bytes(),
+        _ => unreachable!(),
+    };
+    let outer_extensions_raw = extract_extensions_from_client_hello(outer_encoded)?;
+
+    let ech_result = decrypt_ech(outer_hello, outer_encoded, outer_extensions_raw, ech_keys);
+    let retry_configs = collect_retry_configs(ech_keys);
+
+    match ech_result {
+        EchDecryptResult::Fatal(e) => Err(e),
+        EchDecryptResult::Accepted {
+            inner_hello,
+            inner_hello_raw,
+            opener,
+        } => {
+            let (config_id, cipher_suite) = match &outer_hello.encrypted_client_hello {
+                Some(EncryptedClientHello::Outer(o)) => (Some(o.config_id), Some(o.cipher_suite)),
+                _ => (None, None),
+            };
+            let random = inner_hello.random;
+            Ok(EchOffer::Resolved {
+                inner_input: Some(make_inner_input(input, inner_hello, &inner_hello_raw)),
+                state: EchServerState::accepted(
+                    random,
+                    opener,
+                    retry_configs,
+                    config_id,
+                    cipher_suite,
+                ),
+            })
+        }
+        EchDecryptResult::Rejected => Ok(EchOffer::Resolved {
+            inner_input: None,
+            state: EchServerState::rejected(retry_configs),
+        }),
+        EchDecryptResult::NotOffered | EchDecryptResult::InnerDirect => Ok(EchOffer::None),
+    }
+}
+
+/// Collect retry_configs from all keys marked as retry configs.
+fn collect_retry_configs(ech_keys: &[EchServerKey]) -> Vec<EchConfigPayload> {
+    ech_keys
+        .iter()
+        .filter(|k| k.is_retry_config)
+        .map(|k| k.config.clone())
+        .collect()
+}
+
+/// Build an `Input` wrapping a decrypted inner ClientHello.
+fn make_inner_input<'m>(
+    outer_input: &crate::conn::Input<'m>,
+    inner_hello: ClientHelloPayload,
+    inner_hello_raw: &[u8],
+) -> crate::conn::Input<'m> {
+    use crate::crypto::cipher::Payload;
+    use crate::msgs::{HandshakeMessagePayload, HandshakePayload, Message, MessagePayload};
+
+    let inner_payload = encode_inner_hello(inner_hello_raw);
+    crate::conn::Input {
+        message: Message {
+            version: outer_input.message.version,
+            payload: MessagePayload::Handshake {
+                encoded: Payload::Owned(inner_payload),
+                parsed: HandshakeMessagePayload(HandshakePayload::ClientHello(inner_hello)),
+            },
+        },
+        aligned_handshake: outer_input.aligned_handshake,
+    }
+}
+
+/// Build a handshake-encoded ClientHello from raw bytes.
+///
+/// Constructs the `type(1) || length(3) || body` encoding needed for the
+/// transcript hash.
+fn encode_inner_hello(raw: &[u8]) -> Vec<u8> {
+    let mut hdr = Vec::with_capacity(4 + raw.len());
+    hdr.push(0x01); // HandshakeType::ClientHello
+    let len = raw.len();
+    hdr.push((len >> 16) as u8);
+    hdr.push((len >> 8) as u8);
+    hdr.push(len as u8);
+    hdr.extend_from_slice(raw);
+    hdr
+}
+
+/// Compute the ECH acceptance confirmation for the last 8 bytes of
+/// ServerHello.random.
+///
+/// See <https://datatracker.ietf.org/doc/html/rfc9849#section-7.2>.
+pub(crate) fn server_ech_confirmation(
+    hkdf_provider: &'static dyn crate::crypto::tls13::Hkdf,
+    inner_random: &[u8; 32],
+    transcript_ech_conf: crate::crypto::hash::Output,
+) -> [u8; 8] {
+    crate::tls13::key_schedule::server_ech_confirmation_secret(
+        hkdf_provider,
+        inner_random,
+        transcript_ech_conf,
+    )
 }
 
 #[cfg(test)]

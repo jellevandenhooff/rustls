@@ -1126,6 +1126,24 @@ fn hkdf_expand_label_slice(
     })
 }
 
+/// Compute the ECH acceptance confirmation for ServerHello.
+///
+/// This is independent of the TLS key schedule. It uses HKDF-Extract(0, inner_random)
+/// as the PRK.
+pub(crate) fn server_ech_confirmation_secret(
+    hkdf_provider: &'static dyn Hkdf,
+    client_hello_inner_random: &[u8],
+    hs_hash: hash::Output,
+) -> [u8; 8] {
+    hkdf_expand_label(
+        hkdf_provider
+            .extract_from_secret(None, client_hello_inner_random)
+            .as_ref(),
+        SecretKind::ServerEchConfirmationSecret.to_bytes(),
+        hs_hash.as_ref(),
+    )
+}
+
 pub(crate) fn server_ech_hrr_confirmation_secret(
     hkdf_provider: &'static dyn Hkdf,
     client_hello_inner_random: &[u8],
