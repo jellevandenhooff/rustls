@@ -2,8 +2,11 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::crypto::hpke::{Hpke, HpkePrivateKey};
-use crate::error::Error;
-use crate::msgs::{Codec, EchConfigPayload, Reader, SizedPayload};
+use crate::error::{Error, PeerMisbehaved};
+use crate::msgs::{
+    ClientHelloPayload, Codec, EchConfigPayload, EncryptedClientHello, ExtensionType, Reader,
+    SizedPayload,
+};
 
 /// A server-side ECH key, pairing a published ECH config with the corresponding
 /// HPKE private key.
@@ -147,6 +150,221 @@ pub enum EchStatus {
     Rejected,
 }
 
+// --- Wire-level ClientHello helpers ---
+//
+// ECH requires working with the raw wire encoding of the ClientHello rather
+// than the parsed `ClientHelloPayload`. This is because:
+//
+// - The AAD for HPKE decryption is the ClientHello body with the ECH
+//   ciphertext zeroed out (RFC 9849 Section 5.2), which must match the
+//   exact byte layout the client sent.
+// - The inner ClientHello is reconstructed by splicing raw extension bytes
+//   from the outer hello (RFC 9849 Section 5.1), preserving wire ordering.
+// - The transcript hash must cover the reconstructed bytes, not a
+//   re-encoding from parsed structures.
+//
+// The raw bytes come from `MessagePayload::Handshake { encoded, .. }`,
+// which retains the original wire encoding alongside the parsed message.
+// Storing raw bytes inside `ClientHelloPayload` would require adding a
+// lifetime parameter that would propagate through much of the codebase.
+
+/// Extract the raw extensions bytes from a ClientHello handshake message encoding.
+///
+/// `encoded` is the full handshake message (type + length + body).
+pub(crate) fn extract_extensions_from_client_hello(encoded: &[u8]) -> Result<&[u8], Error> {
+    let err = || -> Error { PeerMisbehaved::InvalidEchClientHelloInner.into() };
+
+    let mut r = Reader::new(encoded);
+
+    // Skip handshake header: type (1) + length (3)
+    let _hs_type = u8::read(&mut r).map_err(|_| err())?;
+    let _len = u24_read(&mut r).ok_or_else(err)?;
+
+    // Skip ClientHello fixed fields
+    let _ = u16::read(&mut r).map_err(|_| err())?; // version
+    let _ = r.take(32).ok_or_else(err)?; // random
+    let sid_len = u8::read(&mut r).map_err(|_| err())? as usize;
+    let _ = r.take(sid_len).ok_or_else(err)?;
+    let cs_len = u16::read(&mut r).map_err(|_| err())? as usize;
+    let _ = r.take(cs_len).ok_or_else(err)?;
+    let comp_len = u8::read(&mut r).map_err(|_| err())? as usize;
+    let _ = r.take(comp_len).ok_or_else(err)?;
+    let ext_len = u16::read(&mut r).map_err(|_| err())? as usize;
+    r.take(ext_len).ok_or_else(err)
+}
+
+fn u24_read(r: &mut Reader<'_>) -> Option<usize> {
+    let bytes = r.take(3)?;
+    Some(((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | (bytes[2] as usize))
+}
+
+/// Decode an EncodedClientHelloInner and reconstruct the full inner ClientHello.
+///
+/// Returns both a parsed `ClientHelloPayload` and the raw bytes (for the
+/// transcript hash).
+///
+/// See <https://datatracker.ietf.org/doc/html/rfc9849#section-5.1>.
+pub(crate) fn decode_client_hello_inner(
+    encoded: &[u8],
+    outer_hello: &ClientHelloPayload,
+    outer_extensions_raw: &[u8],
+) -> Result<(ClientHelloPayload, Vec<u8>), Error> {
+    if encoded.is_empty() {
+        return Err(PeerMisbehaved::InvalidEchClientHelloInner.into());
+    }
+
+    let raw_inner = reconstruct_inner_bytes(encoded, outer_hello, outer_extensions_raw)?;
+
+    let mut reader = Reader::new(&raw_inner);
+    let inner_hello = ClientHelloPayload::read(&mut reader)
+        .map_err(|_| Error::from(PeerMisbehaved::InvalidEchClientHelloInner))?;
+
+    // Per RFC 9849 Section 7.1, the inner hello MUST contain the ECH inner marker.
+    if !matches!(
+        inner_hello.encrypted_client_hello,
+        Some(EncryptedClientHello::Inner)
+    ) {
+        return Err(PeerMisbehaved::InvalidEchClientHelloInner.into());
+    }
+
+    // Per RFC 9849 Section 7.1, the inner hello MUST contain supported_versions
+    // offering only TLS 1.3 or higher.
+    match &inner_hello
+        .extensions
+        .supported_versions
+    {
+        Some(versions) if !versions.tls12 => {}
+        _ => return Err(PeerMisbehaved::InvalidEchClientHelloInner.into()),
+    }
+
+    Ok((inner_hello, raw_inner))
+}
+
+/// Reconstruct the inner ClientHello as raw bytes by splicing extensions at
+/// the byte level.
+///
+/// See <https://datatracker.ietf.org/doc/html/rfc9849#section-5.1>.
+fn reconstruct_inner_bytes(
+    content: &[u8],
+    outer_hello: &ClientHelloPayload,
+    outer_extensions_raw: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let err = || -> Error { PeerMisbehaved::InvalidEchClientHelloInner.into() };
+
+    let mut r = Reader::new(content);
+
+    let client_version = u16::read(&mut r).map_err(|_| err())?;
+    let random = r.take(32).ok_or_else(err)?;
+
+    // EncodedClientHelloInner has an empty session_id
+    let session_id_len = u8::read(&mut r).map_err(|_| err())?;
+    if session_id_len != 0 {
+        return Err(err());
+    }
+
+    let cs_len = u16::read(&mut r).map_err(|_| err())? as usize;
+    let cipher_suites = r.take(cs_len).ok_or_else(err)?;
+    let comp_len = u8::read(&mut r).map_err(|_| err())? as usize;
+    let compression = r.take(comp_len).ok_or_else(err)?;
+    let ext_len = u16::read(&mut r).map_err(|_| err())? as usize;
+    let inner_extensions = r.take(ext_len).ok_or_else(err)?;
+
+    // Remaining bytes must be all-zero padding
+    let padding = r.rest();
+    if !padding.iter().all(|&b| b == 0) {
+        return Err(PeerMisbehaved::InvalidEchPadding.into());
+    }
+
+    // Rebuild with outer session_id and expanded extensions
+    let expanded_extensions = expand_extensions_raw(inner_extensions, outer_extensions_raw)?;
+
+    let mut out =
+        Vec::with_capacity(2 + 32 + 33 + 2 + cs_len + 1 + comp_len + 2 + expanded_extensions.len());
+    out.extend_from_slice(&client_version.to_be_bytes());
+    out.extend_from_slice(random);
+    outer_hello.session_id.encode(&mut out);
+    out.extend_from_slice(&(cs_len as u16).to_be_bytes());
+    out.extend_from_slice(cipher_suites);
+    out.push(comp_len as u8);
+    out.extend_from_slice(compression);
+    out.extend_from_slice(&(expanded_extensions.len() as u16).to_be_bytes());
+    out.extend_from_slice(&expanded_extensions);
+
+    Ok(out)
+}
+
+/// Expand ech_outer_extensions references in the inner hello's extensions.
+///
+/// Walks `inner_extensions` and replaces any `ech_outer_extensions` marker with
+/// the referenced extensions copied from `outer_extensions_raw`. The spec
+/// requires references to be listed in the same order as the outer hello.
+///
+/// See <https://datatracker.ietf.org/doc/html/rfc9849#section-5.1>.
+fn expand_extensions_raw(
+    inner_extensions: &[u8],
+    outer_extensions_raw: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let err = || -> Error { PeerMisbehaved::InvalidEchOuterExtension.into() };
+
+    let mut out = Vec::with_capacity(inner_extensions.len() + 128);
+    let mut r = Reader::new(inner_extensions);
+
+    while r.any_left() {
+        let ext_type = u16::read(&mut r).map_err(|_| err())?;
+        let ext_len = u16::read(&mut r).map_err(|_| err())? as usize;
+        let ext_data = r.take(ext_len).ok_or_else(err)?;
+
+        if ext_type == u16::from(ExtensionType::EncryptedClientHelloOuterExtensions) {
+            let mut list_reader = Reader::new(ext_data);
+            let list_len = u8::read(&mut list_reader).map_err(|_| err())? as usize;
+            let list_data = list_reader
+                .take(list_len)
+                .ok_or_else(err)?;
+
+            if list_len == 0 || list_reader.any_left() {
+                return Err(err());
+            }
+
+            let mut type_reader = Reader::new(list_data);
+            let mut outer_reader = Reader::new(outer_extensions_raw);
+
+            while type_reader.any_left() {
+                let want = u16::read(&mut type_reader).map_err(|_| err())?;
+
+                // Must not reference encrypted_client_hello
+                if want == u16::from(ExtensionType::EncryptedClientHello) {
+                    return Err(err());
+                }
+
+                // Seek forward (references must be in outer-hello order)
+                loop {
+                    if !outer_reader.any_left() {
+                        return Err(err());
+                    }
+                    let found_type = u16::read(&mut outer_reader).map_err(|_| err())?;
+                    let found_len = u16::read(&mut outer_reader).map_err(|_| err())? as usize;
+                    let found_data = outer_reader
+                        .take(found_len)
+                        .ok_or_else(err)?;
+
+                    if found_type == want {
+                        out.extend_from_slice(&found_type.to_be_bytes());
+                        out.extend_from_slice(&(found_len as u16).to_be_bytes());
+                        out.extend_from_slice(found_data);
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.extend_from_slice(&ext_type.to_be_bytes());
+            out.extend_from_slice(&(ext_len as u16).to_be_bytes());
+            out.extend_from_slice(ext_data);
+        }
+    }
+
+    Ok(out)
+}
+
 /// Generate an ECH server key and the corresponding serialized ECHConfigList.
 ///
 /// The returned `EchServerKey` should be stored in `ServerConfig::ech_keys`.
@@ -262,5 +480,172 @@ mod tests {
 
         let result = EchServerKey::from_raw(&config_bytes, vec![0u8; 32], &[]);
         assert!(matches!(result, Err(Error::General(msg)) if msg.contains("no matching HPKE suite")));
+    }
+
+    fn make_hello(random: [u8; 32]) -> ClientHelloPayload {
+        use alloc::boxed::Box;
+
+        use crate::crypto::CipherSuite;
+        use crate::enums::ProtocolVersion;
+        use crate::msgs::SupportedProtocolVersions;
+        use crate::msgs::{ClientExtensions, Compression, Random, SessionId};
+
+        let extensions = ClientExtensions {
+            supported_versions: Some(SupportedProtocolVersions {
+                tls13: true,
+                tls12: false,
+            }),
+            ..Default::default()
+        };
+        ClientHelloPayload {
+            client_version: ProtocolVersion::TLSv1_2,
+            random: Random(random),
+            session_id: SessionId::empty(),
+            cipher_suites: vec![CipherSuite::TLS13_AES_128_GCM_SHA256],
+            compression_methods: vec![Compression::Null],
+            extensions: Box::new(extensions),
+        }
+    }
+
+    #[test]
+    fn inner_hello_strips_padding() {
+        let mut inner = make_hello([0x42u8; 32]);
+        inner.encrypted_client_hello = Some(EncryptedClientHello::Inner);
+
+        let mut encoded = inner.get_encoding();
+        encoded.extend_from_slice(&[0u8; 31]);
+
+        let mut outer = make_hello([0x11u8; 32]);
+        let sid_bytes = {
+            let mut b = vec![32u8];
+            b.extend_from_slice(&[0xAB; 32]);
+            b
+        };
+        outer.session_id = crate::msgs::SessionId::read(&mut Reader::new(&sid_bytes)).unwrap();
+
+        let (decoded, _raw) = decode_client_hello_inner(&encoded, &outer, &[]).unwrap();
+
+        assert_eq!(decoded.session_id, outer.session_id);
+        assert_eq!(decoded.random.0, [0x42u8; 32]);
+        assert!(matches!(
+            decoded.encrypted_client_hello,
+            Some(EncryptedClientHello::Inner)
+        ));
+    }
+
+    #[test]
+    fn inner_hello_rejects_truly_empty() {
+        let outer = make_hello([0x11u8; 32]);
+        assert!(decode_client_hello_inner(&[], &outer, &[]).is_err());
+    }
+
+    #[test]
+    fn inner_hello_rejects_garbage() {
+        let encoded = vec![0u8; 32];
+        let outer = make_hello([0x11u8; 32]);
+        assert!(decode_client_hello_inner(&encoded, &outer, &[]).is_err());
+    }
+
+    #[test]
+    fn inner_hello_rejects_missing_marker() {
+        let inner = make_hello([0x42u8; 32]);
+        let encoded = inner.get_encoding();
+        let outer = make_hello([0x11u8; 32]);
+        assert!(decode_client_hello_inner(&encoded, &outer, &[]).is_err());
+    }
+
+    #[test]
+    fn inner_hello_rejects_nonzero_padding() {
+        let mut inner = make_hello([0x42u8; 32]);
+        inner.encrypted_client_hello = Some(EncryptedClientHello::Inner);
+        let mut encoded = inner.get_encoding();
+        // Append non-zero padding
+        encoded.extend_from_slice(&[0x01; 4]);
+
+        let outer = make_hello([0x11u8; 32]);
+        let err = decode_client_hello_inner(&encoded, &outer, &[]).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PeerMisbehaved(PeerMisbehaved::InvalidEchPadding)
+        ));
+    }
+
+    // --- expand_extensions_raw tests ---
+
+    /// Build a raw extension: type(2) || length(2) || data
+    fn raw_ext(ext_type: u16, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&ext_type.to_be_bytes());
+        out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// Build an ech_outer_extensions extension referencing the given types.
+    fn outer_ext_ref(types: &[u16]) -> Vec<u8> {
+        // list_len(1) || type_id(2) * N
+        let list_len = (types.len() * 2) as u8;
+        let mut data = vec![list_len];
+        for &t in types {
+            data.extend_from_slice(&t.to_be_bytes());
+        }
+        raw_ext(0xfd00, &data)
+    }
+
+    #[test]
+    fn expand_extensions_copies_outer_extension() {
+        // Inner has an ech_outer_extensions reference to type 0x0033 (key_share)
+        let inner_exts = outer_ext_ref(&[0x0033]);
+
+        // Outer has key_share with some data
+        let outer_exts = raw_ext(0x0033, &[0xAA, 0xBB, 0xCC]);
+
+        let result = expand_extensions_raw(&inner_exts, &outer_exts).unwrap();
+
+        // Result should be the outer key_share extension
+        assert_eq!(result, raw_ext(0x0033, &[0xAA, 0xBB, 0xCC]));
+    }
+
+    #[test]
+    fn expand_extensions_preserves_non_referenced() {
+        // Inner has a regular extension followed by an outer reference
+        let mut inner_exts = raw_ext(0x0001, &[0x11]);
+        inner_exts.extend_from_slice(&outer_ext_ref(&[0x0033]));
+
+        let outer_exts = raw_ext(0x0033, &[0xAA]);
+
+        let result = expand_extensions_raw(&inner_exts, &outer_exts).unwrap();
+
+        let mut expected = raw_ext(0x0001, &[0x11]);
+        expected.extend_from_slice(&raw_ext(0x0033, &[0xAA]));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn expand_extensions_rejects_out_of_order() {
+        // Reference types 0x0033 then 0x002b, but outer has 0x002b before 0x0033
+        let inner_exts = outer_ext_ref(&[0x0033, 0x002b]);
+
+        let mut outer_exts = raw_ext(0x002b, &[0x01]);
+        outer_exts.extend_from_slice(&raw_ext(0x0033, &[0x02]));
+
+        assert!(expand_extensions_raw(&inner_exts, &outer_exts).is_err());
+    }
+
+    #[test]
+    fn expand_extensions_rejects_ech_reference() {
+        // Reference to EncryptedClientHello (0xfe0d) is forbidden
+        let inner_exts = outer_ext_ref(&[0xfe0d]);
+        let outer_exts = raw_ext(0xfe0d, &[0x01]);
+
+        assert!(expand_extensions_raw(&inner_exts, &outer_exts).is_err());
+    }
+
+    #[test]
+    fn expand_extensions_rejects_missing_outer() {
+        // Reference type 0x0033, but outer doesn't have it
+        let inner_exts = outer_ext_ref(&[0x0033]);
+
+        assert!(expand_extensions_raw(&inner_exts, &[]).is_err());
     }
 }

@@ -1010,6 +1010,9 @@ pub enum PeerMisbehaved {
     IncorrectBinder,
     IncorrectFinished,
     InvalidCertCompression,
+    InvalidEchClientHelloInner,
+    InvalidEchOuterExtension,
+    InvalidEchPadding,
     InvalidKeyShare,
     InvalidMaxEarlyDataSize,
     KeyEpochWithPendingFragment,
@@ -1081,6 +1084,10 @@ impl From<PeerMisbehaved> for AlertDescription {
             PeerMisbehaved::IncorrectBinder | PeerMisbehaved::IncorrectFinished => {
                 Self::DecryptError
             }
+
+            PeerMisbehaved::InvalidEchClientHelloInner
+            | PeerMisbehaved::InvalidEchOuterExtension
+            | PeerMisbehaved::InvalidEchPadding => Self::IllegalParameter,
 
             PeerMisbehaved::InvalidCertCompression
             | PeerMisbehaved::SelectedUnofferedCertCompression => Self::BadCertificate,
