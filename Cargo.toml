@@ -36,6 +36,8 @@ members = [
 exclude = [
   # `cargo fuzz` integration (requires nightly)
   "fuzz",
+  # QUIC ECH split-mode proxy demo (standalone, will be moved)
+  "quic-ech-proxy",
 ]
 
 default-members = [

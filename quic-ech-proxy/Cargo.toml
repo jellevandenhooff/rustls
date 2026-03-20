@@ -1,0 +1,28 @@
+[package]
+name = "quic-ech-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "quic-ech-proxy"
+path = "src/main.rs"
+
+[dependencies]
+# ECH proxy API and config generation
+rustls = { path = "../rustls" }
+rustls-aws-lc-rs = { path = "../rustls-aws-lc-rs" }
+pki-types = { package = "rustls-pki-types", version = "1.14" }
+
+# QUIC Initial packet crypto (HKDF, AES-GCM, AES-ECB header protection)
+ring = "0.17"
+aes = "0.8"
+cipher = "0.4"
+
+# Async runtime + networking
+tokio = { version = "1", features = ["full"] }
+
+# CLI + error handling
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"

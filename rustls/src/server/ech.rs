@@ -951,6 +951,24 @@ pub(crate) fn server_ech_confirmation(
 /// TLS record header length: content_type(1) + version(2) + length(2).
 const TLS_RECORD_HEADER_LEN: usize = 5;
 
+/// Result of processing a ClientHello for ECH split-mode proxying.
+///
+/// Returned by [`EchProxy::process_client_hello_msg`].
+#[derive(Debug)]
+pub enum EchProxyResult {
+    /// ECH was successfully decrypted. Contains the inner ClientHello as a
+    /// handshake message (`type(1) || length(3) || body`), ready to be placed
+    /// in a QUIC CRYPTO frame or TLS record for forwarding to the backend.
+    Decrypted(Vec<u8>),
+    /// No ECH extension was present. The original ClientHello should be
+    /// forwarded unchanged.
+    NotOffered,
+    /// ECH decryption failed (config mismatch, wrong key, etc). The original
+    /// ClientHello should be forwarded unchanged. Contains serialized
+    /// retry\_configs that the backend may send in EncryptedExtensions.
+    Rejected(Vec<u8>),
+}
+
 /// ECH split-mode proxy for a client-facing frontend server.
 ///
 /// In ECH split mode ([RFC 9849 Section 3.1]), a client-facing frontend holds
@@ -1065,6 +1083,44 @@ impl EchProxy {
         }
     }
 
+    /// Process raw ClientHello handshake message bytes (without TLS record framing).
+    ///
+    /// This is the QUIC counterpart of [`process_client_record`]. Use it when
+    /// the ClientHello arrives in a QUIC CRYPTO frame rather than a TLS record.
+    ///
+    /// The input `hs_msg` should be the raw handshake message bytes starting with
+    /// the ClientHello type byte (0x01), as extracted from QUIC CRYPTO frame data.
+    ///
+    /// On success with [`EchProxyResult::Decrypted`], the returned bytes are the
+    /// inner ClientHello handshake message (including the `ech_is_inner` marker),
+    /// ready to be placed in a CRYPTO frame for forwarding to the backend.
+    ///
+    /// [`process_client_record`]: EchProxy::process_client_record
+    pub fn process_client_hello_msg(&mut self, hs_msg: &[u8]) -> Result<EchProxyResult, Error> {
+        if let Some(ref mut frontend) = self.frontend {
+            // Second ClientHello after HRR.
+            let inner = frontend.decrypt_handshake_msg_hrr(hs_msg)?;
+            self.done = true;
+            Ok(EchProxyResult::Decrypted(inner))
+        } else {
+            // First ClientHello.
+            match EchFrontend::decrypt_handshake_msg(hs_msg, &self.keys)? {
+                EchFrontendResult::Decrypted(inner, frontend) => {
+                    self.frontend = Some(frontend);
+                    Ok(EchProxyResult::Decrypted(inner))
+                }
+                EchFrontendResult::NotOffered => {
+                    self.done = true;
+                    Ok(EchProxyResult::NotOffered)
+                }
+                EchFrontendResult::Rejected(retry_configs) => {
+                    self.done = true;
+                    Ok(EchProxyResult::Rejected(retry_configs))
+                }
+            }
+        }
+    }
+
     /// Whether ECH processing is complete.
     ///
     /// After this returns true, all subsequent client-to-server and
@@ -1095,8 +1151,8 @@ struct EchFrontend {
 
 /// Result of decrypting ECH from a ClientHello in the split-mode frontend.
 enum EchFrontendResult {
-    /// ECH was successfully decrypted. The `Vec<u8>` contains a complete TLS
-    /// record with the inner ClientHello, ready to forward to the backend.
+    /// ECH was successfully decrypted. The `Vec<u8>` contains the inner
+    /// ClientHello as a handshake message (`type || length || body`).
     Decrypted(Vec<u8>, EchFrontend),
 
     /// ECH decryption failed (config mismatch, wrong key, etc).
@@ -1108,12 +1164,11 @@ enum EchFrontendResult {
 }
 
 impl EchFrontend {
-    /// Decrypt ECH from a ClientHello TLS record.
-    fn decrypt_client_hello_record(
-        tls_record: &[u8],
+    /// Core ECH decryption on raw handshake message bytes (no TLS record framing).
+    fn decrypt_handshake_msg(
+        handshake_message: &[u8],
         ech_keys: &[EchServerKey],
     ) -> Result<EchFrontendResult, Error> {
-        let (record_version, handshake_message) = parse_tls_record(tls_record)?;
         let outer_hello = parse_client_hello(handshake_message)?;
         let outer_extensions_raw = extract_extensions_from_client_hello(handshake_message)?;
 
@@ -1131,15 +1186,14 @@ impl EchFrontend {
                     _ => unreachable!(),
                 };
 
-                let inner_record =
-                    wrap_handshake_in_record(record_version, &encode_inner_hello(&inner_hello_raw));
+                let inner_msg = encode_inner_hello(&inner_hello_raw);
                 let frontend = EchFrontend {
                     opener,
                     config_id: ech_ext.config_id,
                     cipher_suite: ech_ext.cipher_suite,
                 };
 
-                Ok(EchFrontendResult::Decrypted(inner_record, frontend))
+                Ok(EchFrontendResult::Decrypted(inner_msg, frontend))
             }
             EchDecryptResult::Fatal(e) => Err(e),
             EchDecryptResult::Rejected => {
@@ -1155,12 +1209,26 @@ impl EchFrontend {
         }
     }
 
-    /// Decrypt ECH from a second ClientHello TLS record after HelloRetryRequest.
-    fn decrypt_client_hello_record_hrr(
-        &mut self,
+    /// Decrypt ECH from a ClientHello TLS record.
+    fn decrypt_client_hello_record(
         tls_record: &[u8],
-    ) -> Result<Vec<u8>, Error> {
+        ech_keys: &[EchServerKey],
+    ) -> Result<EchFrontendResult, Error> {
         let (record_version, handshake_message) = parse_tls_record(tls_record)?;
+        match Self::decrypt_handshake_msg(handshake_message, ech_keys)? {
+            EchFrontendResult::Decrypted(inner_msg, frontend) => {
+                let inner_record = wrap_handshake_in_record(record_version, &inner_msg);
+                Ok(EchFrontendResult::Decrypted(inner_record, frontend))
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Core ECH HRR decryption on raw handshake message bytes.
+    fn decrypt_handshake_msg_hrr(
+        &mut self,
+        handshake_message: &[u8],
+    ) -> Result<Vec<u8>, Error> {
         let outer_hello = parse_client_hello(handshake_message)?;
         let outer_extensions_raw = extract_extensions_from_client_hello(handshake_message)?;
 
@@ -1173,10 +1241,17 @@ impl EchFrontend {
             Some(self.cipher_suite),
         )?;
 
-        Ok(wrap_handshake_in_record(
-            record_version,
-            &encode_inner_hello(&inner_hello_raw),
-        ))
+        Ok(encode_inner_hello(&inner_hello_raw))
+    }
+
+    /// Decrypt ECH from a second ClientHello TLS record after HelloRetryRequest.
+    fn decrypt_client_hello_record_hrr(
+        &mut self,
+        tls_record: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        let (record_version, handshake_message) = parse_tls_record(tls_record)?;
+        let inner_msg = self.decrypt_handshake_msg_hrr(handshake_message)?;
+        Ok(wrap_handshake_in_record(record_version, &inner_msg))
     }
 }
 
