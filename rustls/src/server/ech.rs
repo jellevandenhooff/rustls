@@ -112,6 +112,14 @@ impl EchServerKey {
         self
     }
 
+    /// Return the raw private key bytes.
+    ///
+    /// This is useful for persisting the key to disk so it can be reloaded
+    /// later with [`EchServerKey::from_raw`].
+    pub fn private_key_bytes(&self) -> &[u8] {
+        self.private_key.secret_bytes()
+    }
+
     pub(crate) fn config_id(&self) -> Option<u8> {
         match &self.config {
             EchConfigPayload::V18(contents) => Some(contents.key_config.config_id),
@@ -146,6 +154,9 @@ pub enum EchStatus {
     /// The client offered ECH and the server successfully decrypted the inner
     /// ClientHello.
     Accepted,
+    /// The ClientHello arrived with the `ech_is_inner` (type=1) marker,
+    /// indicating a split-mode frontend already decrypted and forwarded it.
+    AcceptedInnerDirect,
     /// The client did not offer ECH.
     #[default]
     NotOffered,
@@ -208,7 +219,7 @@ impl EchServerState {
             inner_random,
             opener: Box::new(NoOpOpener),
             retry_configs: Vec::new(),
-            status: EchStatus::Accepted,
+            status: EchStatus::AcceptedInnerDirect,
             config_id: None,
             cipher_suite: None,
         }
@@ -736,7 +747,7 @@ pub(crate) fn resolve_ech<'m>(
 
     // Second ClientHello after HRR with accepted ECH: decrypt using saved opener.
     if done_retry {
-        if let Some(ech_state) = ech_state.filter(|s| s.status == EchStatus::Accepted) {
+        if let Some(ech_state) = ech_state.filter(|s| matches!(s.status, EchStatus::Accepted | EchStatus::AcceptedInnerDirect)) {
             return resolve_ech_hrr(input, outer_hello, ech_state);
         }
         return Ok(EchOffer::None);

@@ -554,7 +554,7 @@ mod client_hello {
         // 2. Compute the transcript hash through this modified ServerHello
         // 3. Derive accept_confirmation (independent of TLS key schedule)
         // 4. Replace those 8 bytes with the confirmation value
-        if let Some(ech) = ech_state.filter(|e| e.status == crate::server::ech::EchStatus::Accepted)
+        if let Some(ech) = ech_state.filter(|e| matches!(e.status, crate::server::ech::EchStatus::Accepted | crate::server::ech::EchStatus::AcceptedInnerDirect))
         {
             // Create ServerHello with zeroed confirmation bytes for transcript
             let mut conf_random = server_random;
@@ -672,7 +672,7 @@ mod client_hello {
         // Per RFC 9849 Section 7.2.1, the HRR includes an encrypted_client_hello
         // extension with 8 bytes of confirmation signal.
         let ech_ext = if let Some(ech) =
-            ech_state.filter(|e| e.status == crate::server::ech::EchStatus::Accepted)
+            ech_state.filter(|e| matches!(e.status, crate::server::ech::EchStatus::Accepted | crate::server::ech::EchStatus::AcceptedInnerDirect))
         {
             // Build the HRR with 8 zero bytes as placeholder, compute transcript,
             // then derive the real confirmation.

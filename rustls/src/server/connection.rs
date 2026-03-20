@@ -629,6 +629,10 @@ impl ServerConnectionData {
     pub(crate) fn server_name(&self) -> Option<&DnsName<'static>> {
         self.sni.as_ref()
     }
+
+    pub(crate) fn ech_status(&self) -> super::ech::EchStatus {
+        self.ech_status
+    }
 }
 
 impl SideOutput for ServerConnectionData {

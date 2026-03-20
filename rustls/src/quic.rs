@@ -282,6 +282,15 @@ mod connection {
             self.inner.core.side.server_name()
         }
 
+        /// Return the connection's Encrypted Client Hello (ECH) status.
+        ///
+        /// This indicates whether the client offered ECH, and if so, whether the
+        /// server successfully decrypted it. The value is available after the
+        /// ClientHello has been processed.
+        pub fn ech_status(&self) -> crate::server::ech::EchStatus {
+            self.inner.core.side.ech_status()
+        }
+
         /// Set the resumption data to embed in future resumption tickets supplied to the client.
         ///
         /// Defaults to the empty byte string. Must be less than 2^15 bytes to allow room for other
