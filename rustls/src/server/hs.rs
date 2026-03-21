@@ -402,7 +402,7 @@ impl ChooseConfig {
         output: &mut dyn Output<'_>,
     ) -> Result<ServerState, Error> {
         ExpectClientHello::new(config, extra_exts, self.resumption_data, self.protocol)
-            .with_input(ClientHelloInput::from_input(&self.client_hello)?, output)
+            .handle(self.client_hello, output)
     }
 
     pub(crate) fn client_hello(&self) -> &ClientHelloPayload {
@@ -438,6 +438,10 @@ pub(crate) struct ExpectClientHello {
     pub(super) using_ems: bool,
     pub(super) done_retry: bool,
     pub(super) send_tickets: usize,
+    /// Server-side ECH state.
+    pub(super) ech: super::ech::EchServerState,
+    /// Resolved ECH key index, stored for retry_configs access.
+    pub(super) ech_index: Arc<super::ech::EchKeyIndex>,
 }
 
 impl ExpectClientHello {
@@ -464,6 +468,8 @@ impl ExpectClientHello {
             using_ems: false,
             done_retry: false,
             send_tickets: 0,
+            ech: super::ech::EchServerState::new(),
+            ech_index: Arc::new(super::ech::EchKeyIndex::new(Vec::new())),
         }
     }
 
@@ -559,7 +565,8 @@ impl ExpectClientHello {
         }
 
         // Choose a certificate.
-        let credentials = self
+        let is_ech_inner = self.ech.is_accepted();
+        let credentials = match self
             .config
             .cert_resolver
             .resolve(&ClientHello::new(
@@ -567,7 +574,18 @@ impl ExpectClientHello {
                 &sig_schemes,
                 sni.as_ref(),
                 T::VERSION,
-            ))?;
+                is_ech_inner,
+            )) {
+            Ok(cred) => cred,
+            Err(_) if input.outer_hello.is_some() => {
+                // ECH rewind: the cert resolver cannot serve the inner SNI.
+                self.ech.rewind();
+                output.emit(Event::ServerEchAccepted(None));
+                let input = ClientHelloInput::from_input(input.outer_hello.unwrap())?;
+                return self.with_input(input, output);
+            }
+            Err(e) => return Err(e),
+        };
         self.sni = sni;
 
         let (suite, skxg) = self.choose_suite_and_kx_group(
@@ -713,11 +731,48 @@ impl ExpectClientHello {
 
 impl ExpectClientHello {
     pub(crate) fn handle<'m>(
-        self,
-        input: Input<'m>,
+        mut self,
+        outer_input: Input<'m>,
         output: &mut dyn Output<'_>,
     ) -> Result<ServerState, Error> {
-        let input = ClientHelloInput::from_input(&input)?;
+        let ech_index = self.config.ech_keys.resolve();
+        let inner_input = if !self.done_retry {
+            self.ech.resolve(
+                &ech_index,
+                &outer_input,
+                self.config.accept_ech_inner_direct,
+            )?
+        } else {
+            self.ech.resolve_retry(&outer_input)?
+        };
+
+        let input = if let Some(ref inner_input) = inner_input {
+            // ECH decrypted: build frontend info from the outer hello's SNI.
+            let outer_hello = require_handshake_msg!(
+                outer_input.message,
+                HandshakeType::ClientHello,
+                HandshakePayload::ClientHello
+            )?;
+            let outer_sni = outer_hello
+                .server_name
+                .as_ref()
+                .and_then(ServerNamePayload::to_dns_name_normalized);
+            let config_id = self.ech.config_id().unwrap_or(0);
+            output.emit(Event::ServerEchAccepted(Some(
+                super::ech::EchFrontendInfo {
+                    config_id,
+                    outer_server_name: outer_sni,
+                },
+            )));
+
+            let mut input = ClientHelloInput::from_input(inner_input)?;
+            input.outer_hello = Some(&outer_input);
+            input
+        } else {
+            output.emit(Event::ServerEchAccepted(None));
+            ClientHelloInput::from_input(&outer_input)?
+        };
+        self.ech_index = ech_index;
         self.with_input(input, output)
     }
 
@@ -750,6 +805,9 @@ pub(crate) struct ClientHelloInput<'a> {
     pub(super) client_hello: &'a ClientHelloPayload,
     pub(super) sig_schemes: &'a Vec<SignatureScheme>,
     pub(super) proof: HandshakeAlignedProof,
+    /// When processing a decrypted ECH inner ClientHello, holds the original
+    /// outer input for fallback if cert resolution fails (ECH rewind).
+    pub(super) outer_hello: Option<&'a Input<'a>>,
 }
 
 impl<'a> ClientHelloInput<'a> {
@@ -788,6 +846,7 @@ impl<'a> ClientHelloInput<'a> {
             client_hello,
             sig_schemes,
             proof,
+            outer_hello: None,
         })
     }
 }

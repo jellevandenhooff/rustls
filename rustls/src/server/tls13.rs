@@ -187,6 +187,7 @@ mod client_hello {
                     input.client_hello.session_id,
                     output,
                     kx_group.name(),
+                    st.ech.backend(),
                 );
                 if !st.protocol.is_quic() {
                     emit_fake_ccs(output);
@@ -258,6 +259,7 @@ mod client_hello {
                 resuming.as_ref(),
                 &input.proof,
                 &st.config,
+                st.ech.backend(),
             )?;
             if !st.done_retry && !st.protocol.is_quic() {
                 emit_fake_ccs(output);
@@ -274,6 +276,11 @@ mod client_hello {
 
             let mut ocsp_response = signer.ocsp.as_deref();
             let mut flight = HandshakeFlightTls13::new(&mut transcript);
+            let ech_retry_configs = if st.ech.is_accepted() {
+                &[][..]
+            } else {
+                st.ech_index.retry_configs()
+            };
             let (
                 Tls13Extensions {
                     certificate_types,
@@ -291,6 +298,7 @@ mod client_hello {
                     .map(|(_, session)| session),
                 st.extra_exts,
                 &st.config,
+                ech_retry_configs,
             )?;
 
             let doing_client_auth = if full_handshake {
@@ -526,6 +534,7 @@ mod client_hello {
         resuming: Option<&(usize, Tls13ServerSessionValue<'_>)>,
         proof: &HandshakeAlignedProof,
         config: &ServerConfig,
+        ech_backend: Option<&crate::server::ech::EchBackend>,
     ) -> Result<KeyScheduleHandshake, Error> {
         // Prepare key exchange; the caller already found the matching SupportedKxGroup
         let (share, kxgroup) = share_and_kxgroup;
@@ -540,12 +549,18 @@ mod client_hello {
             ..Default::default()
         });
 
-        let sh = Message {
+        let mut server_random = randoms.server;
+        if ech_backend.is_some() {
+            // Zero the confirmation bytes; they'll be patched after encoding.
+            server_random[24..32].fill(0x00);
+        }
+
+        let mut sh = Message {
             version: ProtocolVersion::TLSv1_2,
             payload: MessagePayload::handshake(HandshakeMessagePayload(
                 HandshakePayload::ServerHello(ServerHelloPayload {
                     legacy_version: ProtocolVersion::TLSv1_2,
-                    random: Random::from(randoms.server),
+                    random: Random::from(server_random),
                     session_id: *session_id,
                     cipher_suite: suite.common.suite,
                     compression_method: Compression::Null,
@@ -553,6 +568,12 @@ mod client_hello {
                 }),
             )),
         };
+
+        if let Some(backend) = ech_backend {
+            let confirmation = backend.server_hello_confirmation(suite, transcript, &sh);
+            sh.payload
+                .patch_encoded(crate::server::ech::ECH_CONFIRMATION_SPAN, &confirmation);
+        }
 
         let client_hello_hash = transcript.hash_given(&[]);
 
@@ -615,17 +636,34 @@ mod client_hello {
         session_id: SessionId,
         output: &mut dyn Output<'_>,
         group: NamedGroup,
+        ech_backend: Option<&crate::server::ech::EchBackend>,
     ) {
-        let req = HelloRetryRequest {
+        let mut req = HelloRetryRequest {
             legacy_version: ProtocolVersion::TLSv1_2,
             session_id,
             cipher_suite: suite.common.suite,
             extensions: HelloRetryRequestExtensions {
                 key_share: Some(group),
                 supported_versions: Some(ProtocolVersion::TLSv1_3),
+                encrypted_client_hello: ech_backend
+                    .is_some()
+                    .then(|| Payload::Owned(vec![0u8; 8])),
                 ..Default::default()
             },
         };
+
+        if let Some(backend) = ech_backend {
+            // Build a message with zeros for the transcript, derive confirmation,
+            // then rebuild with the real value.
+            let placeholder = Message {
+                version: ProtocolVersion::TLSv1_2,
+                payload: MessagePayload::handshake(HandshakeMessagePayload(
+                    HandshakePayload::HelloRetryRequest(req.clone()),
+                )),
+            };
+            let confirmation = backend.hrr_confirmation(suite, transcript, &placeholder);
+            req.extensions.encrypted_client_hello = Some(Payload::Owned(confirmation.to_vec()));
+        }
 
         let m = Message {
             version: ProtocolVersion::TLSv1_2,
@@ -708,6 +746,7 @@ mod client_hello {
         resumedata: Option<&Tls13ServerSessionValue<'_>>,
         extra_exts: ServerExtensionsInput,
         config: &ServerConfig,
+        ech_retry_configs: &[crate::msgs::EchConfigPayload],
     ) -> Result<(Tls13Extensions, EarlyDataDecision), Error> {
         let (out, mut extensions) = Tls13Extensions::new(
             extra_exts,
@@ -717,6 +756,16 @@ mod client_hello {
             output,
             config,
         )?;
+
+        // If ECH was rejected, include retry_configs in EncryptedExtensions.
+        // Per RFC 9849 section 7.1, the server MUST include retry_configs
+        // when rejecting ECH. When ECH is accepted, do NOT send this extension.
+        // <https://datatracker.ietf.org/doc/html/rfc9849#section-7.1>
+        if !ech_retry_configs.is_empty() {
+            extensions.encrypted_client_hello_ack = Some(crate::msgs::ServerEncryptedClientHello {
+                retry_configs: ech_retry_configs.to_vec(),
+            });
+        }
 
         let early_data = decide_if_early_data_allowed(
             output,
