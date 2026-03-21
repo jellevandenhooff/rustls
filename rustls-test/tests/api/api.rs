@@ -32,9 +32,10 @@ use rustls::{
 use rustls_aws_lc_rs::hpke::ALL_SUPPORTED_SUITES;
 use rustls_test::{
     Altered, ClientConfigExt, ClientStorage, ClientStorageOp, ErrorFromPeer, KeyType,
-    MockServerVerifier, RawTls, ServerConfigExt, do_handshake, do_handshake_until_error,
-    do_suite_and_kx_test, encoding, make_client_config, make_client_config_with_auth, make_pair,
-    make_pair_for_arc_configs, make_pair_for_configs, make_server_config,
+    MockServerVerifier, RawTls, ServerConfigExt, do_handshake, do_handshake_altered,
+    do_handshake_until_error, do_suite_and_kx_test, encoding, make_client_config,
+    make_client_config_with_auth, make_pair, make_pair_for_arc_configs, make_pair_for_configs,
+    make_server_config, make_server_config_with_kx_groups,
     make_server_config_with_mandatory_client_auth, provider_with_one_suite, provider_with_suites,
     server_name, transfer, transfer_altered, unsafe_plaintext_crypto_provider,
 };
@@ -1479,6 +1480,158 @@ fn test_ech_server_rejects_wrong_config_id() {
     let result = do_handshake_until_error(&mut client, &mut server);
     // ECH rejection causes the client to abort with ech_required
     assert!(result.is_err());
+}
+
+#[cfg(feature = "aws-lc-rs")]
+#[test]
+fn test_ech_split_mode_proxy() {
+    use core::cell::RefCell;
+
+    use rustls::server::{EchProxy, EchProxyResult};
+
+    let provider = provider::DEFAULT_TLS13_PROVIDER;
+    let hpke_suite = ALL_SUPPORTED_SUITES[0];
+
+    let (ech_server_key, config_list_bytes) =
+        generate_ech_config(hpke_suite, 0x42, "public.example.com", 128);
+    let ech_index = Arc::new(rustls::server::EchKeyIndex::new(vec![ech_server_key]));
+
+    let mut server_config = make_server_config(KeyType::EcdsaP256, &provider);
+    server_config.accept_ech_inner_direct = true;
+
+    let ech_config =
+        EchConfig::new(EchConfigListBytes::from(config_list_bytes), &[hpke_suite]).unwrap();
+    let client_config = ClientConfig::builder(provider.into())
+        .with_ech(EchMode::Enable(ech_config))
+        .finish(KeyType::EcdsaP256);
+
+    let (client, server) = make_pair_for_configs(client_config, server_config);
+
+    let proxy = RefCell::new(EchProxy::new(ech_index));
+    let proxy_filter = |msg: &mut EncodedMessage<Vec<u8>>| -> Altered {
+        if msg.typ != ContentType::Handshake || msg.payload.first() != Some(&0x01) {
+            return Altered::InPlace;
+        }
+        match proxy
+            .borrow_mut()
+            .process(&msg.payload)
+            .unwrap()
+        {
+            EchProxyResult::Decrypted(inner) => {
+                Altered::Raw(encoding::message_framing(msg.typ, msg.version, inner))
+            }
+            EchProxyResult::NotOffered | EchProxyResult::Rejected(_) => Altered::InPlace,
+            _ => Altered::InPlace,
+        }
+    };
+    let no_alter = |_: &mut EncodedMessage<Vec<u8>>| -> Altered { Altered::InPlace };
+
+    let result = do_handshake_altered(client, no_alter, proxy_filter, server);
+    assert!(result.is_ok(), "handshake failed: {:?}", result.err());
+}
+
+#[cfg(feature = "aws-lc-rs")]
+#[test]
+fn test_ech_split_mode_proxy_with_hrr() {
+    use core::cell::RefCell;
+    use std::borrow::Cow;
+
+    use rustls::server::{EchProxy, EchProxyResult};
+
+    let provider = provider::DEFAULT_TLS13_PROVIDER;
+    let hpke_suite = ALL_SUPPORTED_SUITES[0];
+
+    let (ech_server_key, config_list_bytes) =
+        generate_ech_config(hpke_suite, 0x42, "public.example.com", 128);
+    let ech_index = Arc::new(rustls::server::EchKeyIndex::new(vec![ech_server_key]));
+
+    let mut server_config = make_server_config_with_kx_groups(
+        KeyType::EcdsaP256,
+        vec![provider::kx_group::SECP384R1],
+        &provider,
+    );
+    server_config.accept_ech_inner_direct = true;
+
+    let ech_config =
+        EchConfig::new(EchConfigListBytes::from(config_list_bytes), &[hpke_suite]).unwrap();
+    let client_config = ClientConfig::builder(
+        CryptoProvider {
+            kx_groups: Cow::Owned(vec![
+                provider::kx_group::X25519,
+                provider::kx_group::SECP384R1,
+            ]),
+            ..provider
+        }
+        .into(),
+    )
+    .with_ech(EchMode::Enable(ech_config))
+    .finish(KeyType::EcdsaP256);
+
+    let (client, server) = make_pair_for_configs(client_config, server_config);
+
+    let proxy = RefCell::new(EchProxy::new(ech_index));
+    let proxy_filter = |msg: &mut EncodedMessage<Vec<u8>>| -> Altered {
+        if msg.typ != ContentType::Handshake || msg.payload.first() != Some(&0x01) {
+            return Altered::InPlace;
+        }
+        match proxy
+            .borrow_mut()
+            .process(&msg.payload)
+            .unwrap()
+        {
+            EchProxyResult::Decrypted(inner) => {
+                Altered::Raw(encoding::message_framing(msg.typ, msg.version, inner))
+            }
+            EchProxyResult::NotOffered | EchProxyResult::Rejected(_) => Altered::InPlace,
+            _ => Altered::InPlace,
+        }
+    };
+    let no_alter = |_: &mut EncodedMessage<Vec<u8>>| -> Altered { Altered::InPlace };
+
+    let result = do_handshake_altered(client, no_alter, proxy_filter, server);
+    assert!(
+        result.is_ok(),
+        "handshake with HRR failed: {:?}",
+        result.err()
+    );
+}
+
+#[cfg(feature = "aws-lc-rs")]
+#[test]
+fn test_ech_proxy_rejected() {
+    use rustls::server::{EchProxy, EchProxyResult};
+
+    let provider = provider::DEFAULT_TLS13_PROVIDER;
+    let hpke_suite = ALL_SUPPORTED_SUITES[0];
+
+    let (_, config_list_bytes) = generate_ech_config(hpke_suite, 1, "public.example.com", 128);
+
+    let (proxy_key, _) = generate_ech_config(hpke_suite, 99, "public.example.com", 128);
+    let proxy_index = Arc::new(rustls::server::EchKeyIndex::new(vec![proxy_key]));
+
+    let ech_config =
+        EchConfig::new(EchConfigListBytes::from(config_list_bytes), &[hpke_suite]).unwrap();
+    let client_config = ClientConfig::builder(provider.clone().into())
+        .with_ech(EchMode::Enable(ech_config))
+        .finish(KeyType::EcdsaP256);
+
+    let server_config = make_server_config(KeyType::EcdsaP256, &provider);
+    let (client, _server) = make_pair_for_configs(client_config, server_config);
+
+    let mut buf = Vec::new();
+    let mut client = client;
+    client.write_tls(&mut buf).unwrap();
+
+    // Strip the 5-byte TLS record header to get the handshake message
+    let hs_msg = &buf[5..];
+
+    let mut proxy = EchProxy::new(proxy_index);
+    let result = proxy.process(hs_msg).unwrap();
+    assert!(
+        matches!(result, EchProxyResult::Rejected(_)),
+        "expected Rejected, got {:?}",
+        result
+    );
 }
 
 #[cfg(feature = "aws-lc-rs")]
