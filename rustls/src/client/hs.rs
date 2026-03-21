@@ -831,9 +831,10 @@ fn emit_client_hello_for_retry(
         payload: MessagePayload::handshake(chp),
     };
 
-    if retryreq.is_some() {
-        // send dummy CCS to fool middleboxes prior
-        // to second client hello
+    if retryreq.is_some() && !input.protocol.is_quic() {
+        // send dummy CCS to fool middleboxes prior to second client hello
+        // (not needed in QUIC; unclear if this guard is fully correct,
+        // added for ECH QUIC split-mode proxy testing)
         tls13::emit_fake_ccs(&mut input.sent_tls13_fake_ccs, output);
     }
 
